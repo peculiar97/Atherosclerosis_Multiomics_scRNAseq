@@ -1,0 +1,921 @@
+---
+title: "MQ_Meta_Analysis_Bulk_Figures_2_3"
+output: html_document
+date: "2024-05-14"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r echo=FALSE, include=FALSE, eval=TRUE, cache=TRUE}
+# Set the working Directory
+setwd("/shared_home/my_analysis/ChipSeeker")
+
+# List of libraries
+libraries <- c("DESeq2", "readr", "readxl", "writexl", "WriteXLS", "tibble", "dplyr", "stringr", 
+               "GenomicRanges", "rafalib", "cowplot", "data.table", 
+               "purrr", "tidyverse", "purrr", "PerformanceAnalytics", "ChIPseeker", 
+               "clusterProfiler", "ComplexUpset", "TxDb.Mmusculus.UCSC.mm10.knownGene", 
+               "org.Mm.eg.db", "ggcorrplot", "ggplot2", "enrichplot", "rtracklayer", "kableExtra", "knitr")
+
+# Load each library separately
+for (lib in libraries) {
+  if (!require(lib, character.only = TRUE)) {
+    #install.packages(lib)
+    library(lib, character.only = TRUE)
+  }
+}
+```
+
+## Comparing all the peaks at one glance
+
+### Intro
+
+-   **Steps to prepare the high-quality peaks:**
+    -   The raw sequencing data for each dataset were analysed using relevant pipelines(Encode/NF-core)\
+    -   Peak calling is then performed on all replicates, pooled data, self-pseudoreplicates of each bio-replicate and the pooled pseudoreplicates. The workflow supports calling of two general types of peaks: narrow and region.The MACS2 and SPP methods are used for peak calling. The MACS2 software has a mode for narrow peak calling and can be used for both tf and histone pipeline type, while SPP is preferably used for region peak calling when analysing transcription factor binding sites.
+    -   As a way to assess concordance of peak calls between replicates, the IDR tool is used as the next step, along with Overlap, providing input peak files for the Reproducibility tool in order to obtain reproducibility QC. The basic idea is that if two replicates measure the same underlying biology, the most significant peaks, which are likely to be genuine signals, are expected to have high consistency between replicates, whereas peaks with low significance, which are more likely to be noise, are expected to have low consistency.
+
+```{r echo=FALSE, fig.width=11, fig.height=9, cache=TRUE}
+#### Importing & Peak Annotation & Enrichment & Plotting
+
+file_p = "/shared_home/my_analysis/ChipSeeker"
+
+TxDb_mm10 = TxDb.Mmusculus.UCSC.mm10.knownGene
+org_mm10 = org.Mm.eg.db
+
+# Reading Peak files
+STAT1_UT_natoli = readPeakFile("/shared_home/my_analysis/ChipSeeker/STAT1_UT_natoli_idr.optimal_peak.regionPeak.bed", header=F)
+STAT1_2hIFNg_natoli = readPeakFile("/shared_home/my_analysis/ChipSeeker/STAT1_2hIFNg_natoli_idr.optimal_peak.regionPeak.bed", header=F)
+
+PU1_UT_langlais = readPeakFile(file.path(file_p,"PU1_UT_langlais_idr.optimal_peak.regionPeak.bed"), header=F)
+PU1_IFNg_3h_langlais = readPeakFile(file.path(file_p,"PU1_IFNg_3h_langlais_idr.optimal_peak.regionPeak.bed"), header=F)
+
+H3K27ac_UT_natoli = readPeakFile(file.path(file_p, "H3K27ac_UT_natoli_overlap.optimal_peak.narrowPeak.bed"), header=F)
+H3K27ac_2hIFNg_natoli = readPeakFile(file.path(file_p, "H3K27ac_2hIFNg_natoli_overlap.optimal_peak.narrowPeak.bed"), header=F)
+
+H3K4me1_UT_Barozzi = readPeakFile(file.path(file_p, "H3K4me1_UT_Barozzi_overlap.optimal_peak.narrowPeak.bed"), header=F)
+H3K4me1_2hIFNg_Barozzi = readPeakFile(file.path(file_p, "H3K4me1_IFNg_2h_Barozzi_overlap.optimal_peak.narrowPeak.bed"), header=F)
+
+H3K4me3_UT_Barozzi = readPeakFile(file.path(file_p, "H3K4me3_UT_Barozzi_overlap.optimal_peak.narrowPeak.bed"), header=F)
+H3K4me3_4hIFNg_Barozzi = readPeakFile(file.path(file_p, "H3K4me3_IFNg_4h_Barozzi_overlap.optimal_peak.narrowPeak.bed"), header=F)
+
+TREATMENT_90min_decker_ATAC = readPeakFile(file.path(file_p,"TREATMENT.mRp.clN_peaks.broadPeak.bed"), header=F)
+CONTROL_UT_decker_ATAC = readPeakFile(file.path(file_p, "CONTROL.mRp.clN_peaks.broadPeak.bed"), header=F)
+
+
+Epi_data_list = GRangesList(STAT1_UT_natoli=STAT1_UT_natoli,
+                            STAT1_2hIFNg_natoli=STAT1_2hIFNg_natoli, 
+                            PU1_UT_langlais= PU1_UT_langlais,
+                            PU1_IFNg_3h_langlais=PU1_IFNg_3h_langlais, 
+                            H3K27ac_UT_natoli = H3K27ac_UT_natoli,
+                            H3K27ac_2hIFNg_natoli= H3K27ac_2hIFNg_natoli,
+                            H3K4me1_UT_Barozzi = H3K4me1_UT_Barozzi,
+                            H3K4me1_2hIFNg_Barozzi = H3K4me1_2hIFNg_Barozzi, 
+                            H3K4me3_UT_Barozzi = H3K4me3_UT_Barozzi,
+                            H3K4me3_4hIFNg_Barozzi = H3K4me3_4hIFNg_Barozzi,
+                            CONTROL_UT_decker_ATAC= CONTROL_UT_decker_ATAC,
+                            TREATMENT_90min_decker_ATAC = TREATMENT_90min_decker_ATAC)
+
+# These files are in /shared_home/my_analysis/ChipSeeker
+epi_files = list(ATAC_UT="CONTROL.mRp.clN_peaks.broadPeak.bed",
+            ATAC_IFNg="TREATMENT.mRp.clN_peaks.broadPeak.bed",
+            STAT1_UT = "STAT1_UT_natoli_idr.optimal_peak.regionPeak.bed",
+            STAT1_IFNg="STAT1_2hIFNg_natoli_idr.optimal_peak.regionPeak.bed",
+            PU1_UT = "PU1_UT_langlais_idr.optimal_peak.regionPeak.bed",
+            PU1_IFNg =  "PU1_IFNg_3h_langlais_idr.optimal_peak.regionPeak.bed",
+            H3K27ac_UT = "H3K27ac_UT_natoli_overlap.optimal_peak.narrowPeak.bed",
+            H3K27ac_IFNg="H3K27ac_2hIFNg_natoli_overlap.optimal_peak.narrowPeak.bed",
+            H3K4me1_UT =  "H3K4me1_UT_Barozzi_overlap.optimal_peak.narrowPeak.bed",
+            H3K4me1_IFNg = "H3K4me1_IFNg_2h_Barozzi_overlap.optimal_peak.narrowPeak.bed",
+            H3K4me3_UT = "H3K4me3_UT_Barozzi_overlap.optimal_peak.narrowPeak.bed",
+            H3K4me3_IFNg = "H3K4me3_IFNg_4h_Barozzi_overlap.optimal_peak.narrowPeak.bed")
+
+# Annotate Peaks
+#peakAnnoList = lapply(Epi_data_list, annotatePeak, TxDb = TxDb_mm10, annoDb="org.Mm.eg.db") 
+#annoDb, which is optional and only use to convert entrez gene ID to gene symbol
+
+#save
+#saveRDS(peakAnnoList, file = "peakAnnolist.rds")
+peakAnnoList=readRDS(file = "peakAnnolist.rds")
+
+# Selecting peaks in promoter region
+peakAnnoList_promo = lapply(peakAnnoList, function(gr) {
+  df = as.data.frame(gr)
+  df[grep("Promoter", df$annotation),]})
+
+# FUNCTIONAL ENRICHMENT ANALYSIS
+peakAnnoList_genes = lapply(peakAnnoList, function(i) as.data.frame(i)$geneId)
+
+#peakAnnoList_genes_enrichGO = compareCluster(geneCluster = peakAnnoList_genes, fun = "enrichGO", pvalueCutoff = 0.05, ont="BP", OrgDb = "org.Mm.eg.db")
+
+#saveRDS(peakAnnoList_genes_enrichGO, file = "peakAnnoList_genes_enrichGO.rds")
+
+peakAnnoList_genes_enrichGO = readRDS(file = "peakAnnoList_genes_enrichGO.rds")
+
+#peakAnnoList_genes_enrichKEGG = compareCluster(geneCluster = peakAnnoList_genes, fun = "enrichKEGG", pvalueCutoff = 0.05) # No enrichment
+```
+
+
+## Correlation
+
+### Intro
+
+-   **Steps to prepare correlation plots:**
+    -   All the bed files generated using respective piplines(Encode/Nf-core) were merged together.
+    -   The peaks in merged file were counted in each dataset using featureCounts tool as described [here](https://github.com/crazyhottommy/ChIP-seq-analysis/blob/master/part2_Preparing-ChIP-seq-count-table.md).
+    -   All the count table were merged into one for further analysis such as peak annotation, feature selection and correlation analysis.
+
+```{r echo=FALSE, include=FALSE, cache=TRUE}
+##FeatureCount tables
+##Merge featureCount tables & renaming column names & Annotation & Selecting for Promoters
+
+all_files<- list.files("/shared_home/my_analysis/ChipSeeker/count_table/All_epi_tf", pattern = "counts_subreadAll_*", full.names = T)
+
+f_files <- all_files[!grepl("summary$", all_files)]
+f_files = f_files[-c(3,6)] # remove replicates
+
+read_in_feature_counts<- function(file){
+        cnt<- read_tsv(file, col_names =T, comment = "#")
+        cnt<- cnt %>% dplyr::select(-Chr, -Start, -End, -Strand, -Length)
+        return(cnt)
+}
+        
+raw_counts<- map(f_files, read_in_feature_counts)
+raw_counts_df<- purrr::reduce(raw_counts, inner_join)
+
+featCount_all = raw_counts_df
+
+
+############
+
+featCount_all = dplyr::rename(featCount_all, "ATAC_UT" = "CONTROL.mRp.clN.sorted_reheader.bam",
+                              "ATAC_IFNg" = "TREATMENT.mRp.clN.sorted_reheader.bam",
+                              "H3K27ac_UT" =  "H3K27ac_UT_natoli_reheader.bam",
+                              "H3K27ac_IFNg" = "H3K27ac_2hIFNg_reheader.bam",
+                              "H3K4me1_UT" = "H3K4me1_UT_2_reheader.bam",
+                              "H3K4me1_IFNg" = "H3K4me1_2hIFNg_reheader.bam",  
+                              "H3K4me3_UT" = "H3K4me3_UT_reheader.bam",
+                              "H3K4me3_IFNg" = "H3K4me3_IFNg_4h_reheader.bam",
+                              "PU1_UT" = "PU1_UT_langlais_reheader.bam",
+                              "PU1_IFNg" = "PU1_IFNg_3h_reheader.bam", 
+                              "STAT1_UT" = "STAT1_UT_natoli_reheader.bam",
+                               "STAT1_IFNg" = "STAT1_2hIFNg_natoli_reheader.bam")
+
+#Save
+saveRDS(featCount_all, file = "/shared_home/my_analysis/ChipSeeker/count_table/featCount_all.rds")
+
+featCount_allBD = featCount_all %>% separate(Geneid, into = c("chr", "start", "end"), sep = "\\.", remove = F)
+featCount_allBD$start = as.numeric(featCount_allBD$start)
+featCount_allBD$end = as.numeric(featCount_allBD$end)
+
+peaks_all = makeGRangesFromDataFrame(featCount_allBD, keep.extra.columns = T)
+
+peaks_all_anno = annotatePeak(peaks_all, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+
+#Save
+saveRDS(peaks_all_anno, file = "/shared_home/my_analysis/ChipSeeker/count_table/peaks_all_anno.rds")
+
+peaks_all_annoP = as.data.frame(peaks_all_anno)
+
+peaks_all_anno_promo = peaks_all_annoP[str_detect(peaks_all_annoP$annotation, "Promoter"),]
+
+```
+
+
+### Correlation Plots
+
+```{r echo=FALSE, include=TRUE, fig.width=18, fig.height=18, cache=FALSE}
+# All regions
+numeric_vars_all <- dplyr::select(featCount_all, 2:13)
+
+cors_all <- cor(numeric_vars_all, use = "pairwise.complete.obs")
+g1 = ggcorrplot(cors_all, hc.order = F, type = "upper",  outline.col = "white", show.legend = F, lab = F, title = "Correlation in all genomic regions", tl.cex = 8) + theme(title = element_text(size=12))
+
+### Correlation for the peaks in Promoter regions
+# Only Promoters
+numeric_vars_all_promo <- peaks_all_anno_promo %>% dplyr::select(grep("UT|IFNg", names(peaks_all_anno_promo)))
+
+cors_allP <- cor(numeric_vars_all_promo, use = "pairwise.complete.obs")
+g2 = ggcorrplot(cors_allP, hc.order = F, type = "upper",  outline.col = "white", show.legend = T, lab = F, title = "Correlation in promoter regions", tl.cex = 8) + theme(title = element_text(size=12), legend.title = element_text(size = 9))
+
+#plot_grid(g1, g2, ncol  = 2, scale = 1)
+
+g1 | g2
+
+ggsave(filename = "CorPlot.png",width = 180, height = 105, units = "mm", dpi = 300, bg = "white") 
+
+```
+
+## Differntial Peaks
+
+### Intro
+
+-   **Steps to prepare the differential peaks:**
+    -   The raw sequencing data for each dataset were analysed using relevant pipelines(Encode/NF-core)\
+    -   To standardize all sequence alignments from differet datasets, "Tag Directory" was created using the Homer function [makeTagDirectory](http://homer.ucsd.edu/homer/ngs/tagDir.html)
+    -   To find peaks that are differentially enriched between two conditions, the Homer function [getDifferentialPeaks](http://homer.ucsd.edu/homer/ngs/mergePeaks.html) were implemented. Next, these differential peaks were used for downstream analysis such peak annotation and KEGG enrichment analysis.
+
+\newpage
+
+### ATAC-seq
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 2**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE, warning=FALSE, message=FALSE}
+#Selecting top Differential Peaks & Performing GEO & Plotting
+# Folder: "/shared_home/my_analysis/ChipSeeker"
+
+### For ATAC, H3K4me1 & H3K4me3 fold enrichment over background tag count = 2. the remaining is 4
+
+###ATAC
+
+at_diff_FC2 = fread("getDifferentialPeaks/ATAC_DiffPeaks_FC2.tsv")
+
+at_diff_b_FC2 = at_diff_FC2 %>% dplyr::select(chr, start, end)
+at_diff_FC2_bed = makeGRangesFromDataFrame(at_diff_b_FC2)
+at_diff_FC2_bed_anno = annotatePeak(at_diff_FC2_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(at_diff_FC2_bed_anno)
+
+```
+
+#### KEGG Enrichment Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE, warning=FALSE, message=FALSE}
+at_diff_FC2_bed_anno_genID = as.data.frame(at_diff_FC2_bed_anno)$geneId
+at_diff_FC2_bed_anno_Kegg = enrichKEGG(at_diff_FC2_bed_anno_genID, organism = "mmu")
+dotplot(at_diff_FC2_bed_anno_Kegg, showCategory=20)
+
+```
+
+\newpage
+
+### H3K4me1
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 2**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE, warning=FALSE, message=FALSE}
+###H3K4me1
+
+H3K4me1_diff_FC2 = fread("getDifferentialPeaks/H3K4me1_DiffPeaks_2_FC2.tsv")
+
+H3K4me1_diff_b_FC2 = H3K4me1_diff_FC2 %>%dplyr::select(chr, start, end)
+H3K4me1_diff_FC2_bed = makeGRangesFromDataFrame(H3K4me1_diff_b_FC2)
+H3K4me1_diff_FC2_bed_anno = annotatePeak(H3K4me1_diff_FC2_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(H3K4me1_diff_FC2_bed_anno)
+```
+
+#### KEGG Enrichment Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE, warning=FALSE, message=FALSE}
+
+H3K4me1_diff_FC2_bed_anno_genID = as.data.frame(H3K4me1_diff_FC2_bed_anno)$geneId
+H3K4me1_diff_FC2_bed_anno_Kegg = enrichKEGG(H3K4me1_diff_FC2_bed_anno_genID, organism = "mmu")
+dotplot(H3K4me1_diff_FC2_bed_anno_Kegg, showCategory=20)
+```
+
+\newpage
+
+### H3K4me3
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 2**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE, warning=FALSE, message=FALSE}
+###H3K4me3
+
+H3K4me3_diff_FC2 = fread("getDifferentialPeaks/H3K4me3_DiffPeaks_1_FC2.tsv")
+
+H3K4me3_diff_b_FC2 = H3K4me3_diff_FC2 %>%dplyr::select(chr, start, end)
+H3K4me3_diff_FC2_bed = makeGRangesFromDataFrame(H3K4me3_diff_b_FC2)
+H3K4me3_diff_FC2_bed_anno = annotatePeak(H3K4me3_diff_FC2_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(H3K4me3_diff_FC2_bed_anno)
+```
+
+#### KEGG Enrichment Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+
+H3K4me3_diff_FC2_bed_anno_genID = as.data.frame(H3K4me3_diff_FC2_bed_anno)$geneId
+H3K4me3_diff_FC2_bed_anno_Kegg = enrichKEGG(H3K4me3_diff_FC2_bed_anno_genID, organism = "mmu")
+dotplot(H3K4me3_diff_FC2_bed_anno_Kegg, showCategory=20)
+```
+
+\newpage
+
+### H3K27ac
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 4**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE}
+
+h3_diff = fread("getDifferentialPeaks/H3K27ac_DiffPeaks.tsv")
+
+h3_diff_b = h3_diff %>%dplyr::select(chr, start, end)
+h3_diff_bed = makeGRangesFromDataFrame(h3_diff_b)
+h3_diff_bed_anno = annotatePeak(h3_diff_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(h3_diff_bed_anno)
+```
+
+#### KEGG Enrichment Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+
+h3_diff_bed_anno_genID = as.data.frame(h3_diff_bed_anno)$geneId
+h3_diff_bed_anno_Kegg = enrichKEGG(h3_diff_bed_anno_genID, organism = "mmu") #KEGG
+dotplot(h3_diff_bed_anno_Kegg, showCategory=20)
+
+```
+
+\newpage
+
+### STAT1
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 4**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE}
+###STAT1
+st_diff = fread("getDifferentialPeaks/STAT1_DiffPeaks.tsv")
+
+st_diff_b = st_diff %>% dplyr::select(chr, start, end)
+st_diff_bed = makeGRangesFromDataFrame(st_diff_b)
+st_diff_bed_anno = annotatePeak(st_diff_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(st_diff_bed_anno)
+```
+
+#### KEGG Enrichment Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+
+st_diff_bed_anno_genID = as.data.frame(st_diff_bed_anno)$geneId
+
+#KEGG
+st_diff_bed_anno_Kegg = enrichKEGG(st_diff_bed_anno_genID, organism = "mmu")
+dotplot(st_diff_bed_anno_Kegg, showCategory=20) 
+```
+
+\newpage
+
+### PU1
+
+#### Differential Peak Annotation
+
+**Fold change cutoff is 4**
+
+```{r echo=FALSE, include=TRUE,  out.width='70%', out.height='70%', cache=TRUE}
+
+###PU1
+pu_diff = fread("getDifferentialPeaks/PU1_DiffPeaks.tsv")
+
+pu_diff_b = pu_diff %>% dplyr::select(chr, start, end)
+pu_diff_bed = makeGRangesFromDataFrame(pu_diff_b)
+pu_diff_bed_anno = annotatePeak(pu_diff_bed, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db")
+plotAnnoPie(pu_diff_bed_anno)
+```
+
+#### KEGG Enrichment Analysis
+
+**No KEGG enrichment for PU1 differential peaks**
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+
+pu_diff_bed_anno_genID = as.data.frame(pu_diff_bed_anno)$geneId
+
+#KEGG
+#pu_diff_bed_anno_Kegg = enrichKEGG(pu_diff_bed_anno_genID, organism = "mmu") # NO enrichment
+#dotplot(pu_diff_bed_anno_Kegg, showCategory=20)
+```
+
+\newpage
+
+### Summary of Differential Peaks in each Dataset
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+# Num_Differential_Peaks
+diff_peaks_list = list(at_diff_FC2_bed_anno, H3K4me1_diff_FC2_bed_anno, H3K4me3_diff_FC2_bed_anno, h3_diff_bed_anno,st_diff_bed_anno, pu_diff_bed_anno)
+
+#Save
+saveRDS(diff_peaks_list, file = "/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/diff_peaks_list.rds")
+
+#Print
+lapply(diff_peaks_list, function(x) {
+  df = as.data.frame(x)
+  dim(df)[1]
+})
+
+#Num_Unique_GeneIDs
+diff_genID_list = list(at_diff_FC2_bed_anno_genID, H3K4me1_diff_FC2_bed_anno_genID, H3K4me3_diff_FC2_bed_anno_genID, h3_diff_bed_anno_genID, st_diff_bed_anno_genID, pu_diff_bed_anno_genID)
+
+#Save
+saveRDS(diff_genID_list, file = "/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/diff_genID_list.rds")
+
+#Print
+#lapply(diff_genID_list, function(x) length(unique(x)))
+
+# Our RNA-seq (the code chunk number is 544)
+# our MQ RNA-seq was filtered based on FC>1 & padj<0.05 at any time points
+length(unique(our_MQ$gene)) #1736 
+length(unique(up_list_df$ID)) #1139
+### Plotting
+# Creating dataframe
+diff_stats = data.frame(Markers = c("ATAC-seq", "H3K4me1", "H3K4me3", "H3K27ac", "STAT1", "PU.1", "RNA-seq", "Integrative multi-omics"),
+                        Num_Differential_Peaks = c(7326, 8803, 4021, 9450, 6578, 258, NA, NA),
+                        Num_Unique_GeneIDs = c(4102, 6164, 2839, 4166, 3698, 266, 1736, 1139))
+
+diff_stats$Markers <- factor(diff_stats$Markers, levels = diff_stats$Markers[order(diff_stats$Num_Unique_GeneIDs, decreasing = FALSE)])
+
+# Reshape the data
+diff_stats_long <- reshape2::melt(diff_stats, id.vars = "Markers")
+
+# Create the plot
+ggplot(diff_stats_long, aes(x = Markers, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = value), position = position_dodge(width = 0.8), hjust = 0, size = 3) +
+  coord_flip() +
+  labs(x = "", y = "", fill = "", title = "The number of differential peaks and related genes in each dataset") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 11), plot.title = element_text(size = 12),
+        legend.position = "bottom", legend.justification = "center", panel.grid = element_blank()) +
+   scale_fill_discrete(labels = c("Peaks", "Genes"))
+   
+
+ggsave(filename = "Figurs/sum_diff.png", width = 8.5 , height = 4.6)
+
+```
+
+### KEGG Analysis for each dataset
+```{r}
+Markers = c("ATAC-seq", "H3K4me1", "H3K4me3", "H3K27ac", "STAT1", "PU1") 
+
+diff_genID_list = list(at_diff_FC2_bed_anno_genID, H3K4me1_diff_FC2_bed_anno_genID, H3K4me3_diff_FC2_bed_anno_genID, h3_diff_bed_anno_genID, st_diff_bed_anno_genID, pu_diff_bed_anno_genID) #
+
+names(diff_genID_list) = Markers
+
+#BP
+diff_genID_list_enrichGO = compareCluster(geneCluster = diff_genID_list, fun = "enrichGO", pvalueCutoff = 0.05, ont="BP", OrgDb = "org.Mm.eg.db") #Takes time
+
+dotplot(diff_genID_list_enrichGO, title = "Comparing enrichment results of multiple peak list for Biological Process", font.size =9) + scale_x_discrete(guide = guide_axis(angle = 0))
+
+#saveRDS(peakAnnoList_genes_enrichGO, file = "peakAnnoList_genes_enrichGO.rds")
+
+#KEGG
+diff_genID_list_enrichKEGG = compareCluster(geneCluster = diff_genID_list,
+                              fun = "enrichKEGG", pvalueCutoff = 0.05, organism = "mmu")
+#Save
+saveRDS(diff_genID_list_enrichKEGG, file = "/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/diff_genID_list_enrichKEGG.rds")
+
+
+dotplot(diff_genID_list_enrichKEGG, title = "Comparing KEGG results of differential peaks in each dataset", showCategory=3, font.size =10) + scale_x_discrete(guide = guide_axis(angle = 0)) + theme(axis.title.x = element_blank(), axis.text.x = element_text(size = 10))
+
+
+ggsave(filename = "Figurs/kegg_diff.png", width = 8, height = 4.4)
+```
+
+
+
+### Enrichment analysis for overlapping differential peaks
+
+#### KEGG Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+###Overlapping genes
+overlap_FC_peaks = Reduce(intersect, list(as.data.frame(peakAnnoList$PU1_UT_langlais)$geneId, 
+                          H3K4me1_diff_FC2_bed_anno_genID,
+                          h3_diff_bed_anno_genID,
+                          at_diff_FC2_bed_anno_genID,
+                          st_diff_bed_anno_genID,
+                          H3K4me3_diff_FC2_bed_anno_genID ))
+
+overlap_FC_peaks_Kegg = enrichKEGG(overlap_FC_peaks, organism = "mmu") # kegg
+dotplot(overlap_FC_peaks_Kegg, showCategory=20)
+```
+
+#### Biological Process Analysis
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+overlap_FC_peaks_BP = enrichGO(overlap_FC_peaks, OrgDb = "org.Mm.eg.db", ont = "BP") # BP
+dotplot(overlap_FC_peaks_BP, showCategory=20)
+```
+
+\newpage
+
+## Merging Differential Peaks with RNA-seq dataset
+
+### Overlapping genes between Chip-seq, ATAC-seq & RNA-seq
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+# Differential Peaks
+# Overlapping genes: Finding their peaks located in Promoter using fold change data
+diff_peaks_list = list(at_diff_FC2_bed_anno=at_diff_FC2_bed_anno,
+                       H3K4me1_diff_FC2_bed_anno=H3K4me1_diff_FC2_bed_anno, 
+                       H3K4me3_diff_FC2_bed_anno=H3K4me3_diff_FC2_bed_anno,
+                       h3_diff_bed_anno=h3_diff_bed_anno,
+                       st_diff_bed_anno=st_diff_bed_anno,
+                       pu_UT_anno = peakAnnoList$PU1_UT_langlais)
+
+diff_peaks_list_promo = lapply(diff_peaks_list, function(gr) {
+  df = as.data.frame(gr)
+  df[grep("Promoter", df$annotation),]})
+
+diff_peaks_list_promo_ovlpGenes = lapply(diff_peaks_list_promo, function(x) {
+  x[x$geneId %in% overlap_FC_peaks, c("seqnames", "start", "end")]
+})
+
+#Merging all into one dataframe
+ovlp_peaks_promo = do.call(rbind, diff_peaks_list_promo_ovlpGenes)
+
+# Preparing bed file for homer:annotatePeaks.pl
+ovlp_peaks_promo_gr = makeGRangesFromDataFrame(ovlp_peaks_promo)
+export.bed(ovlp_peaks_promo_gr, "ovlp_peaks_promo.bed")
+
+# RNA-seq data sets
+###OUR RNA-seq data set performed on BM-MQ cells
+our_MQ = read_xlsx("BMDM_padj005_FC1.xlsx") 
+our_MQ = our_MQ %>% dplyr::select("gene", "FC max":"padj.x") %>% mutate(across(where(is.character) & !c("gene"), as.numeric))
+our_MQ = our_MQ %>% dplyr::rename("baseMean" = "baseMean.x", "padj" = "padj.x", "FC_max" = "FC max") %>% dplyr::select("gene", "FC_max")
+our_MQ$gene = trimws(our_MQ$gene)
+
+```
+
+### BETA tool
+```{r}
+# Source http://cistrome.org/BETA/tutorial.html
+# https://github.com/hanfeisun/BETA
+
+
+# our MQ RNA-seq
+gene_exp = our_MQ #OUR RNA-seq data set performed on BM-MQ cells
+gene_exp$padj = 0
+
+mm10_ref = fread(file = "BETA/mm10.refseq") # the file is taken from BETA reference or you can get it from https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/genes/
+gene_exp_ref = inner_join(gene_exp, mm10_ref, join_by("gene" == "name2"))
+gene_exp_ref = gene_exp_ref %>% dplyr::rename("refseq" = "#name") %>% dplyr::select("refseq", "FC_max", "padj")
+gene_exp_ref = na.omit(gene_exp_ref, cols = "refseq")
+#WriteXLS(gene_exp, ExcelFileName = "gene_exp.xls", col.names = F)
+write_tsv(gene_exp_ref, file = "BETA/gene_exp_ref.tsv",col_names = F )
+
+# Differential Peaks
+# Overlapping genes: Finding their peaks located in Promoter using fold change data
+diff_peaks_list = list(at_diff_FC2_bed_anno=at_diff_FC2_bed_anno,
+                       H3K4me1_diff_FC2_bed_anno=H3K4me1_diff_FC2_bed_anno, 
+                       H3K4me3_diff_FC2_bed_anno=H3K4me3_diff_FC2_bed_anno,
+                       h3_diff_bed_anno=h3_diff_bed_anno,
+                       st_diff_bed_anno=st_diff_bed_anno,
+                       pu_UT_anno = peakAnnoList$PU1_UT_langlais)
+
+diff_peaks_list_promo = lapply(diff_peaks_list, function(gr) {
+  df = as.data.frame(gr)
+  df[grep("Promoter", df$annotation),]})
+
+# This is the same peaks as in above "ovlp_peaks_promo" 
+diff_peaks_list_promo_ovlpGenes = lapply(diff_peaks_list_promo, function(x) {
+  x[x$geneId %in% overlap_FC_peaks, c("seqnames", "start", "end")]
+})
+
+#Merging all into one dataframe
+diff_peaks_list_promo_ovlpGenes_df = rbindlist(diff_peaks_list_promo_ovlpGenes, idcol = TRUE)
+diff_peaks_list_promo_ovlpGenes_df = diff_peaks_list_promo_ovlpGenes_df %>% rename("name" = ".id" , "chrom" = "seqnames")
+diff_peaks_list_promo_ovlpGenes_df$score = 100 #[From BETA developer]: If your bed don't have the name and score column, please fake one.
+diff_peaks_list_promo_ovlpGenes_df = diff_peaks_list_promo_ovlpGenes_df %>% dplyr::select(chrom, start, end, name, score)
+
+#diff_peaks_list_promo_allGenes_bed = makeGRangesFromDataFrame(diff_peaks_list_promo_allGenes_df)
+
+write_tsv(diff_peaks_list_promo_ovlpGenes_df, file = "BETA/diff_peaks_list_promo_ovlpGenes_df.bed", col_names = F, quote = "none")
+
+###BETA tool results 
+# BETA basic -p diff_peaks_list_promo_ovlpGenes_df.bed -e gene_exp_ref.tsv -k O -g mm10  --info 1,2,3 --da 1 -c 0.9   > screen_BETA.txt 2>&1
+refs = fread("BETA/mm10.refseq")
+refs$ID = mapIds(org.Mm.eg.db, keys = refs$name2, keytype = "SYMBOL", column = "ENTREZID", multiVals = "first")
+
+# using upregulated list
+up_list = fread(file = "BETA/up_list.txt", header = F)
+up_list_ref = inner_join(up_list, mm10_ref, join_by("V1"=="#name"))
+up_list_ref_gene = up_list_ref %>% distinct(name2) %>% pull(name2)
+up_list_df = tibble(SYMBOL=up_list_ref_gene)
+up_list_df$ID = mapIds(org.Mm.eg.db, keys = up_list_df$SYMBOL, keytype = "SYMBOL", column = "ENTREZID", multiVals = "first")
+up_list_df = na.omit(up_list_df, cols = "ID")
+
+# This is the final integrative list between epigenomic and our RNA-seq
+saveRDS(up_list_df, file = "BETA/up_list_df_Integrative.rds")
+
+
+```
+
+
+\newpage
+
+### Top 10 integrative genes in IGV
+
+```{r echo=FALSE, include=TRUE, out.width='110%', out.height='230%', cache=TRUE}
+# Include an external image
+#include_graphics("/shared_home/my_analysis/IGV_files/Top10_overlap_genes.png")
+up_list_integ = readRDS(file = "/shared_home/my_analysis/ChipSeeker/BETA/up_list_df_Integrative.rds")
+beta_ourMQ = inner_join(up_list_integ, our_MQ, join_by("SYMBOL" == "gene")) %>% dplyr::arrange(desc(FC_max))
+
+View(beta_ourMQ)
+
+# Selective list chiefly based on our_MQ fold change in beta_ourMQ.
+ igv_beta_ourMQ = c("Gbp8", "Tgtp2", "Iigp1", "Igtp", "Gbp4", "Cxcl9", "Il18bp", "Socs1", "Ifi44","Stat1")
+ cat(paste(igv_beta_ourMQ, collapse = "\n"))
+ 
+```
+
+\newpage
+
+### KEGG Enrichment Analysis for Overlapping genes (1139 genes)
+
+```{r echo=FALSE, include=TRUE, fig.width=13, fig.height=11, cache=TRUE}
+#overlap_FC_genes_rna_KEGG = enrichKEGG(overlap_FC_genes_rna$IDs, organism = "mmu")
+up_list_df = readRDS(file = "BETA/up_list_df_Integrative.rds")
+overlap_FC_genes_rna_KEGG = enrichKEGG(up_list_df$ID, organism = "mmu")
+dotplot(overlap_FC_genes_rna_KEGG, showCategory=17, font.size = 9.5, title = "KEGG results of integrative genes" ) +
+   theme(axis.title.x = element_blank(), axis.text.x = element_text(size = 10))
+
+ggsave(filename = "Figurs/keeg_integ.png", width = 7.7, height = 7.3 )
+  
+# BP   
+overlap_FC_peaks_BP = enrichGO(up_list_df$ID, OrgDb = "org.Mm.eg.db", ont = "BP") # BP
+dotplot(overlap_FC_peaks_BP, showCategory=20, font.size = 10)
+
+```
+
+
+### STARNET http://starnet.mssm.edu/
+```{r}
+# Human orthologs
+up_list_df_human = gprofiler2::gorth(up_list_df$SYMBOL, source_organism = "mmusculus", target_organism ="hsapiens" )$ortholog_name #Converting to human
+up_list_df_human = up_list_df_human[!is.na(up_list_df_human)]
+
+#cat(paste0(up_list_df_human, collapse = "\n"))
+ 
+# Use this file for Starnet
+# fwrite(list(up_list_df_human), file = "BETA/integrative_genes_human_for_STARNET.txt", col.names = F)
+
+# After running Starnet, the first module with the lowest FDR is selected(#module 194).
+# Extract the data from the figure
+ data = data.frame(
+
+y <- c(0.000002508011364021413, 0.000058663018145931146, 0.00014354163215440842, 0.0002593998222463937, 0.0011990586672050644, 0.0016200055806888628, 2.121955387018906, 3.784177036335724, 5.72561642627023, 6.526715276488983, 8.273906357719177, 12.72088724674749, 14.928376735646422),
+
+x <- c("DUKE", "HbA1c", "SYNTAX", "CAD DEG", "P-Chol", "lesions", "CRP", "BMI", "Diseased vessels", "fP-HDL-Chol", "Waist/Hip", "fP-TG", "fP-LDL-Chol"))
+
+ # Threshold
+-log10(0.05)
+ 
+# Generate the scatter plot
+ggplot(data, aes(x=reorder(x, y), y=y, color = y)) +
+  geom_point() +
+  scale_color_gradient(low = "blue", high = "red") +
+  geom_hline(yintercept = c(1.3), color="black", linetype="dashed") +
+    labs(x = "", y = "Enrichment -log10(P value)", title = "Integrative genes module", subtitle = ) +
+  coord_flip() + theme_bw() + theme(axis.text.x = element_text( hjust = 1), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "white"), legend.position = "none", axis.text = element_text(size = 10), title = element_text(size = 12))
+
+ggsave(filename = "Figurs/integ_module.png", width = 5.8, height = 3.7 )
+```
+
+
+\newpage
+
+## Finding Instances of Motifs near the binding Sites at Promoter
+
+### Intro
+
+-   **Steps taken to quantify motif instances**
+    -   The raw sequencing data for each dataset were analysed using relevant pipelines(Encode/NF-core)\
+    -   The STAT1 and PU1 peaks, generated by a peak caller, were used to select those peaks that were in the immediate vicinity of *Promoter* region(-3000,3000).
+    -   The instances of GAS, ISRE & PU1 motifs in the promoter regions of STAT1 and PU1 binding sites were scanned and quantified using [annotatePeaks.pl](http://homer.ucsd.edu/homer/ngs/quantification.html).
+    -   The PU1 motifs were selected from [Homer Motif library](http://homer.ucsd.edu/homer/custom.motifs).
+    -   The GAS & ISRE motifs were taken from this [paper](https://pubmed.ncbi.nlm.nih.gov/37347298/).
+    -   For the overlapping gene list, only peaks located in the promoter region were selected.
+    -   For PU1 and STAT1, peaks in the IFNg-treated group were shown.
+
+### Density of GAS, ISRE and PU1 motifs near the binding sites at promoter
+
+```{r echo=FALSE, include=TRUE, fig.width=10, fig.height=10, cache=TRUE}
+#/shared_home/my_analysis/homer/bin/annotatePeaks.pl PU1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif > PU1_IFNg_Promoter_vs_motifs_PU1_GAS_ISRE.txt
+
+puMot = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/PU1_IFNg_Promoter_vs_motifs_PU1_GAS_ISRE.txt")
+
+m1 = ggplot() +
+  geom_line(data = puMot, aes(x = puMot$`Distance from Center (cmd=annotatePeaks.pl PU1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`,y = puMot$`PU.1:IRF8(ETS:IRF)/pDC-Irf8-ChIP-Seq(GSE66899)/Homer,BestGuess:PU.1:IRF8(ETS:IRF)/pDC-Irf8-ChIP-Seq(GSE66899)/Homer(1.000) total sites` ,  color = "PU.1" )) +
+  geom_line(data = puMot, aes(x = puMot$`Distance from Center (cmd=annotatePeaks.pl PU1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = puMot$`ISRE_IRF3 total sites`, color = "ISRE")) +
+    geom_line(data = puMot, aes(x = puMot$`Distance from Center (cmd=annotatePeaks.pl PU1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = puMot$`GAS_Stat3_il21 total sites`, color = "GAS")) +
+  labs(
+    x = "Distance from PU.1 peak",
+    y = "Motifs (per bp per Peak)",
+    subtitle = "PU.1",
+    color="Motifs"
+  ) +
+   scale_color_manual(values=c("blue", "red", "green")) + theme_minimal() + 
+  theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_text(size =10), legend.position = "none" ) 
+
+
+### STAT1
+#/shared_home/my_analysis/homer/bin/annotatePeaks.pl ST1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif > ST1_IFNg_Promoter_vs_motifs_PU1_GAS_ISRE.txt
+
+stMot = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/ST1_IFNg_Promoter_vs_motifs_PU1_GAS_ISRE.txt")
+
+m2 = ggplot() +
+  geom_line(data = stMot, aes(x = stMot$`Distance from Center (cmd=annotatePeaks.pl ST1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`,y = stMot$`PU.1:IRF8(ETS:IRF)/pDC-Irf8-ChIP-Seq(GSE66899)/Homer,BestGuess:PU.1:IRF8(ETS:IRF)/pDC-Irf8-ChIP-Seq(GSE66899)/Homer(1.000) total sites`,  color = "PU.1" )) +
+  geom_line(data = stMot, aes(x = stMot$`Distance from Center (cmd=annotatePeaks.pl ST1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = stMot$`ISRE_IRF3 total sites`, color = "ISRE")) +
+    geom_line(data = stMot, aes(x = stMot$`Distance from Center (cmd=annotatePeaks.pl ST1_IFNg_Peaks_in_Promoters.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = stMot$`GAS_Stat3_il21 total sites`, color = "GAS")) +
+  labs(
+    x = "Distance from STAT1 peak",
+    y = "Motifs (per bp per Peak)",
+    subtitle = "STAT1",
+    color="Motifs"
+  ) +
+   scale_color_manual(values=c("blue", "red", "green")) + theme_minimal()  +
+  theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_text(size =10), axis.title.y = element_blank(), legend.position = "none" ) 
+
+  
+
+### Overlapping genes between Chip-seq, ATAC-seq & RNA-seq
+# In bash: /shared_home/my_analysis/homer/bin/annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif > overlp_peaks_promos_vs_motifs_PU1_GAS_ISRE.txt
+
+ovlpMot = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/overlp_peaks_promos_vs_motifs_PU1_GAS_ISRE.txt")
+
+m3 = ggplot() +
+   geom_line(data = ovlpMot, aes(x = ovlpMot$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`,y = ovlpMot$`PU.1(ETS)/ThioMac-PU.1-ChIP-Seq(GSE21512)/Homer,BestGuess:PU.1(ETS)/ThioMac-PU.1-ChIP-Seq(GSE21512)/Homer(1.000) total sites` ,  color = "PU.1" )) +
+   geom_line(data = ovlpMot, aes(x = ovlpMot$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = ovlpMot$`ISRE_IRF8 total sites`, color = "ISRE")) +
+   geom_line(data = ovlpMot, aes(x = ovlpMot$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 1000 -hist 5 -m PU1.motif GAS_ISRE.motif)`, y = ovlpMot$`GAS_Stat3_il21 total sites`, color = "GAS")) +
+  labs(
+    x = "Distance from peaks of integrative genes",
+    y = "Motifs (per bp per Peak)",
+    subtitle = "Integrative genes",
+    color="Motifs") +
+   scale_color_manual(values=c("blue", "red", "green")) + theme_minimal() +
+    theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_text(size =10), axis.title.y = element_blank() ) 
+
+m1 + m2 + m3 + plot_annotation(title = "GAS, ISRE and PU.1 motif distribution near promoter regions", 
+                               theme = theme(title = element_text(size = 12))) +
+                               plot_layout(ncol = 3, guides = 'collect')
+
+ggsave(filename = "Figurs/motif_dist.png", width = 14, height = 5.9)
+
+#plot_grid(m1, m2, m3, nrow = 3, align = "v", scale = 0.85)
+
+```
+
+\newpage
+
+## Distribution of Epigenetic markers near the binding sites at the Promoter
+
+### Intro
+
+-   **Steps taken to quantify the distribution of epigenetic markers**
+    -   The raw sequencing data for each dataset were analysed using relevant pipelines(Encode/NF-core)\
+    -   The STAT1 and PU1 peaks, generated by a peak caller, were used to select those peaks that were in the immediate vicinity of *Promoter* region(-3000,3000).
+    -   The distribution of H3K4me1, H3K4me3 and H3K27ac in the promoter region were quantified using [annotatePeaks.pl](http://homer.ucsd.edu/homer/ngs/quantification.html).
+    -   For the overlapping gene list, only peaks located in the promoter region were selected.
+    -   For PU1 and STAT1, peaks in the IFNg-treated group were shown.
+
+
+### Epigenetic Markers Distribution near the promoter regions of overlapping genes
+
+```{r echo=FALSE, include=TRUE, fig.width=10, fig.height=10, cache=TRUE}
+# Overlapping genes vs H3K4me1
+# In bash: /shared_home/my_analysis/homer/bin/annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me1_UT_2_tag/ H3K4me1_2hIFNg_tag/ > OVERLAP_promoter_vs_H3K4me1_2hIFNg_UT_2.txt
+
+ov_me1 = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/OVERLAP_promoter_vs_H3K4me1_2hIFNg_UT_2.txt")
+
+n1 = ggplot() +
+  geom_line(data = ov_me1, aes(x = ov_me1$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me1_UT_2_tag/ H3K4me1_2hIFNg_tag/)`, y = ov_me1$`H3K4me1_UT_2_tag/ Coverage`, color = "H3K4me1_UT_tag/ Coverage" )) +
+  geom_line(data = ov_me1, aes(x = ov_me1$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me1_UT_2_tag/ H3K4me1_2hIFNg_tag/)`, y = ov_me1$`H3K4me1_2hIFNg_tag/ Coverage`, color = "H3K4me1_IFNg_tag/ Coverage")) +
+  labs(
+    x = "Distance from overlapping peaks (Promoter region)",
+    y = "ChIP-Fragment Depth (per bp per Peak)",
+    subtitle = "H3K4me1",
+    color=""
+  ) +
+   scale_color_manual(values=c("blue", "red")) + theme_minimal() + 
+  theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_blank(), legend.position = "none" ) 
+
+### H3K4me3 Distribution near the promoter regions of overlapping genes    
+# Overlapping genes vs H3K4me3
+# In bash: /shared_home/my_analysis/homer/bin/annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me3_UT_2_tag/ H3K4me3_4hIFNg_tag/ > OVERLAP_promoter_vs_H3K4me3_4hIFNg_UT_2.txt
+
+ov_me3 = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/OVERLAP_promoter_vs_H3K4me3_4hIFNg_UT_2.txt")
+
+n2 = ggplot() +
+  geom_line(data = ov_me3, aes(x = ov_me3$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me3_UT_2_tag/ H3K4me3_4hIFNg_tag/)`, y = ov_me3$`H3K4me3_UT_2_tag/ Coverage`, color = "H3K4me3_UT_tag/ Coverage" )) +
+  geom_line(data = ov_me3, aes(x = ov_me3$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K4me3_UT_2_tag/ H3K4me3_4hIFNg_tag/)`, y = ov_me3$`H3K4me3_4hIFNg_tag/ Coverage`, color = "H3K4me3_IFNg_tag/ Coverage")) +
+  labs(
+    x = "Distance from promoter region",
+    y = "ChIP-Fragment Depth (per bp per Peak)",
+    subtitle = "H3K4me3",
+    color=""
+  ) +
+   scale_color_manual(values=c("blue", "red")) + theme_minimal()  +
+  theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_text(size =10), axis.title.y = element_blank(), legend.position = "none" ) 
+
+### H3K27ac Distribution near the promoter regions of overlapping genes    
+# Overlapping genes vs H3K27ac
+# In bash: /shared_home/my_analysis/homer/bin/annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K27ac_UT_natoli_tag/ H3K27ac_2hIFNg_natoli_tag/ > OVERLAP_promoter_vs_H3K27ac_2hIFNg_UT.txt
+
+ov_ac = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/OVERLAP_promoter_vs_H3K27ac_2hIFNg_UT.txt")
+
+n3 = ggplot() +
+  geom_line(data = ov_ac, aes(x = ov_ac$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K27ac_UT_natoli_tag/ H3K27ac_2hIFNg_natoli_tag/)`, y = ov_ac$`H3K27ac_UT_natoli_tag/ Coverage`, color = "H3K27ac_UT_tag/ Coverage" )) +
+  geom_line(data = ov_ac, aes(x = ov_ac$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d H3K27ac_UT_natoli_tag/ H3K27ac_2hIFNg_natoli_tag/)`, y = ov_ac$`H3K27ac_2hIFNg_natoli_tag/ Coverage`, color = "H3K27ac_IFNg_tag/ Coverage")) +
+  labs(
+    x = "Distance from overlapping peaks (Promoter region)",
+    y = "ChIP-Fragment Depth (per bp per Peak)",
+    subtitle = "H3K27ac",
+    color=""
+  ) +
+   scale_color_manual(labels = c("IFNg_treated", "Control"), values=c("blue", "red")) + theme_minimal() +
+    theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank())
+
+n1 + n2 + n3 + plot_annotation(title = "Epigenetic markers distribution near promoter regions of integrative genes",  theme = theme(title = element_text(size = 12))) +
+                               plot_layout(ncol = 3, guides = 'collect')
+
+ggsave(filename = "Figurs/epigenMark_dist.png", width = 14, height = 5.9)
+
+plot_grid(n1, n2, n3, nrow = 3, align = "v", scale = 0.85)
+
+```
+
+\newpage
+
+## The Binding Site Profile of STAT1 and PU1 near the Promoter of overlapping genes
+
+### Intro
+
+-   **Steps taken to quantify the binding site profile of STAT1 and PU1**
+    -   The raw sequencing data for each dataset were analysed using relevant pipelines(Encode/NF-core)\
+    -   The binding profile of STAT1 and PU1 in the promoter region were quantified using [annotatePeaks.pl](http://homer.ucsd.edu/homer/ngs/quantification.html).
+    -   For the overlapping gene list, only peaks located in the promoter region were selected.
+
+### The Binding Site Profile near the Promoter of overlapping genes
+
+```{r echo=FALSE, include=TRUE, fig.width=10, fig.height=10, cache=TRUE}
+# STAT1 Binding Profile
+# In bash: /shared_home/my_analysis/homer/bin/annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d STAT1_UT_natoli_tag/ STAT1_2hIFNg_natoli_tag/ > OVERLAP_promoter_vs_STAT1_2hIFNg_UT.txt
+ov_st = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/OVERLAP_promoter_vs_STAT1_2hIFNg_UT.txt")
+
+r1 = ggplot() +
+  geom_line(data = ov_st, aes(x = ov_st$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d STAT1_UT_natoli_tag/ STAT1_2hIFNg_natoli_tag/)`, y = ov_st$`STAT1_UT_natoli_tag/ Coverage`, color = "STAT1_UT_tag/ Coverage" )) +
+  geom_line(data = ov_st, aes(x = ov_st$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d STAT1_UT_natoli_tag/ STAT1_2hIFNg_natoli_tag/)`, y = ov_st$`STAT1_2hIFNg_natoli_tag/ Coverage`, color = "STAT1_IFNg_tag/ Coverage")) +
+  labs(
+    x = "Distance from overlapping peaks (Promoter region)",
+    y = "ChIP-Fragment Depth (per bp per Peak)",
+    subtitle = "STAT1",
+    color="") +
+   scale_color_manual(labels = c("IFNg_treated", "Control"), values=c("blue", "red")) +  
+      theme_minimal() +
+    theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+
+### PU1 Binding Profile     
+ov_pu = fread("/shared_home/my_analysis/ChipSeeker/getDifferentialPeaks/OVERLAP_promoter_vs_PU1_3hIFNg_UT.txt")
+
+r2 = ggplot() +
+  geom_line(data = ov_pu, aes(x = ov_pu$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d PU1_UT_langlais_tag/ PU1_IFNg_3h_tag/)`, y = ov_pu$`PU1_UT_langlais_tag/ Coverage`, color = "PU1_UT_tag/ Coverage" )) +
+  geom_line(data = ov_pu, aes(x = ov_pu$`Distance from Center (cmd=annotatePeaks.pl overlp_peaks_promos.bed mm10 -size 4000 -hist 10 -d PU1_UT_langlais_tag/ PU1_IFNg_3h_tag/)`, y = ov_pu$`PU1_IFNg_3h_tag/ Coverage`, color = "PU1_IFNg_tag/ Coverage")) +
+  labs(
+    x = "Distance from promoter region",
+    y = "ChIP-Fragment Depth (per bp per Peak)",
+    subtitle = "PU.1",
+    color="") +
+      scale_color_manual(labels = c("IFNg_treated", "Control"), values=c("blue", "red")) +  
+      theme_minimal() +
+    theme(plot.subtitle = element_text(size = 11), panel.grid = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank(),axis.text.y = element_blank())
+
+
+p <- ggplot() + labs(x = "Distance from promoter region", y = "ChIP-Fragment Depth (per bp per Peak)") +
+  theme(axis.title.x = element_text(size = 12))
+x_axis <- cowplot::get_plot_component(p, "xlab-b")
+y_axis <- cowplot::get_plot_component(p, "ylab-l")
+
+design = "
+DAB
+#CC
+"
+
+r1 + r2 + x_axis + y_axis + plot_annotation(title = "Transcription factor binding distribution near promoter regions of integrative genes",  theme = theme(title = element_text(size = 12))) +
+                    plot_layout(design = design, widths = c(2,50, 50), heights = c(40,1))
+
+ggsave(filename = "Figurs/TF_Mark_dist.png", width = 14, height = 5.9)
+
+# From: https://stackoverflow.com/questions/73042802/r-ggplot2-patchwork-common-axis-labels
+
+#plot_grid(m1, m2, nrow  = 2, scale = 0.85)
+
+```
+
+
+```{r echo=FALSE, eval=FALSE}
+sessionInfo()
+```
