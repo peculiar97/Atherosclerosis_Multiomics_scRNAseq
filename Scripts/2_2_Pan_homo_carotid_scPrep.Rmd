@@ -1,0 +1,329 @@
+---
+title: "Pan_homo_carotid_scPrep"
+output: html_document
+date: "2024-04-01"
+editor_options: 
+  chunk_output_type: console
+---
+# Load libraries
+```{r}
+setwd("Human/")
+
+library(Seurat)
+library(tidyverse)
+library(data.table)
+library(scDblFinder)
+library(celda)
+library(sctransform)
+library(cluster)
+library(readr)
+source("../scRNA_processing_utils.R") # with the modifications from https://github.com/MillerLab-CPHG/Human_athero_scRNA_meta/blob/main/utils/scRNA_processing_utils.R
+
+# Set seed for doublet removal reproducibility
+set.seed(1)
+
+```
+
+# Sample 1: GSM4705589 RPE004 (Caucasian, Male, 83, Symptomatic)
+
+## Prepare the count matrix
+
+```{r}
+# Load Matrix (or use ReadMtx {Seurat})
+rpe004_matrix = data.table::fread("Pan_carotids_scRNA/GSM4705589/GSM4705589_RPE004_matrix.txt", sep="\t", header = TRUE)
+
+rownames(rpe004_matrix) = rpe004_matrix$gene
+head(rownames(rpe004_matrix))
+dim(rpe004_matrix)
+
+# Make sparse matrix and remove "gene" column
+rpe004_sparse_mtx = as.sparse(rpe004_matrix)
+rpe004_sparse_mtx = rpe004_sparse_mtx[, -1]
+
+# 15796 genes x 2614 cells
+dim(rpe004_sparse_mtx)
+
+```
+
+## Create Seurat obj
+```{r}
+#Pre-processing (Create Seurat obj containing doublets)
+# Dims of seurat object: 15179 genes x 2614 cells
+rpe004_seurat_sct = CreateSeuratObject(counts = rpe004_sparse_mtx, 
+                                      project = "pan_rpe004_carotid", 
+                                      min.cells = 10, 
+                                      min.features = 200)
+
+#  before removing doublets
+# SCT normalize
+rpe004_seurat_sct = Seurat_SCT_process(rpe004_seurat_sct, seurat_filter = TRUE,
+                                      sample_id = "pan_rpe004", 
+                                      study_name = "pan_et_al")
+
+###########
+### Finding Best Resolution for integrated object
+
+resolutions_sil_df = calc_sil_scores_for_res(rpe004_seurat_sct, clustering_res = c(0.5, 0.6, 0.7, 0.9, 0.75 ,0.8, 1.0,1.1, 1.4))
+
+max_avg_sil_score(resolutions_sil_df) # 0.6 is Max
+##########
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe004_seurat_sct =  FindClusters(rpe004_seurat_sct, resolution = 0.5) #As suggested by authors
+
+# Visualize clusters
+p1_before_QC = DimPlot(rpe004_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("Before removing doublets") + NoAxes()
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe004_before_QC.png", width = 7, height = 8)
+
+```
+
+## Detect doublets & ambient RNA
+
+```{r}
+# Detect doublets with scDblFinder
+# Called 3 doublets
+rpe004_doublet_ids = scDblFinder_clusters(rpe004_seurat_sct, nrep = 3)
+length(rpe004_doublet_ids)
+
+# First filtering step: Use the vector of consensus doublet IDs output below
+rpe004_singlets = setdiff(colnames(rpe004_sparse_mtx), rpe004_doublet_ids)
+length(rpe004_singlets)
+
+# New dims after removing doublets: 15174 genes x 2606 cells
+rpe004_seurat_sct = CreateSeuratObject(counts = rpe004_sparse_mtx[, rpe004_singlets], 
+                                      project = "pan_rpe004", 
+                                      min.cells = 10, 
+                                      min.features = 200)
+
+# Clean counts matrix (without doublets) from ambient RNA using the decontX wrapper
+rpe004_seurat_sct =  decontX_remove(rpe004_seurat_sct)
+head(rpe004_seurat_sct@assays$RNA@counts)
+
+```
+
+```{r}
+# after removing doublets
+# SCT normalize
+rpe004_seurat_sct = Seurat_SCT_process(rpe004_seurat_sct, seurat_filter = TRUE,
+                                      sample_id = "pan_rpe004", 
+                                      study_name = "pan_et_al")
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe004_seurat_sct =  FindClusters(rpe004_seurat_sct, resolution = 0.5)
+
+p1_after_QC = DimPlot(rpe004_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("After removing doublets + decontX") + NoAxes()
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe004_after_QC.png", width = 7, height = 8)
+
+FeaturePlot(rpe004_seurat_sct, features = c("MYH11", "CNN1", "TNFRSF11B", "ACTA2", 
+                                           "CRTAC1", "LUM"), order = TRUE,  pt.size = 0.1)
+
+FeaturePlot(rpe004_seurat_sct, features = c("CD68", "CD14", "CD163", "APOE", 
+                                           "S100A8", "IL1B"), order = TRUE,  pt.size = 0.1)
+
+FeaturePlot(rpe004_seurat_sct, features = c("MYH11", "CNN1", "FHL5", "FOXC1"), order = TRUE,  pt.size = 0.1)
+
+saveRDS(rpe004_seurat_sct, file = "Pan_carotids_scRNA/GSM4705589_pan_rpe004_processed_seurat_obj.rds")
+```
+
+# Sample 2: GSM4705590 RPE005 (Caucasian, Male, 67, Asymptomatic)
+## Prepare the count matrix
+
+```{r}
+# Load Matrix
+rpe005_matrix = fread("Pan_carotids_scRNA/GSM4705590/GSM4705590_RPE005_matrix.txt", sep="\t", header = TRUE)
+
+rownames(rpe005_matrix) = rpe005_matrix$gene
+head(rownames(rpe005_matrix))
+dim(rpe005_matrix)
+
+# Make sparse matrix and remove "gene" column
+rpe005_sparse_mtx = as.sparse(rpe005_matrix)
+rpe005_sparse_mtx = rpe005_sparse_mtx[, -1]
+
+# 17397 genes x 3486 cells
+dim(rpe005_sparse_mtx)
+```
+
+## Create Seurat obj
+```{r}
+#Pre-processing (Create Seurat obj containing doublets)
+# Dims of seurat object: 16670 genes x 3486 cells
+rpe005_seurat_sct = CreateSeuratObject(counts = rpe005_sparse_mtx, 
+                                       project = "pan_rpe005", 
+                                       min.cells = 10, 
+                                       min.features = 200)
+
+#  before removing doublets
+# SCT normalize
+rpe005_seurat_sct = Seurat_SCT_process(rpe005_seurat_sct, seurat_filter = TRUE,
+                                       sample_id = "pan_rpe005", 
+                                       study_name = "pan_et_al")
+
+###########
+### Finding Best Resolution for integrated object
+
+resolutions_sil_df = calc_sil_scores_for_res(rpe005_seurat_sct, clustering_res = c(0.5, 0.6, 0.7, 0.9, 0.75 ,0.8, 1.0,1.1, 1.4))
+
+max_avg_sil_score(resolutions_sil_df) # 0.6 is Max
+##########
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe005_seurat_sct =  FindClusters(rpe005_seurat_sct, resolution = 0.5)   
+
+# Visualize clusters
+p2_before_QC = DimPlot(rpe005_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("Before removing doublets") + NoAxes()
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe005_before_QC.png", width = 7, height = 8)
+
+```
+
+## Detect doublets & ambient RNA
+
+```{r}
+# Detect doublets with scDblFinder
+# Called 8 doublets
+rpe005_doublet_ids = scDblFinder_clusters(rpe005_seurat_sct, nrep = 3)
+length(rpe005_doublet_ids)
+
+# First filtering step: Use the vector of consensus doublet IDs output below
+rpe005_singlets = setdiff(colnames(rpe005_sparse_mtx), rpe005_doublet_ids)
+length(rpe005_singlets)
+
+# New dims after removing doublets: 16640 genes x 3436 cells
+rpe005_seurat_sct = CreateSeuratObject(counts = rpe005_sparse_mtx[, rpe005_singlets], 
+                                       project = "pan_rpe005", 
+                                       min.cells = 10, 
+                                       min.features = 200)
+
+# Clean counts matrix (without doublets) from ambient RNA using the decontX wrapper
+rpe005_seurat_sct =  decontX_remove(rpe005_seurat_sct)
+head(rpe005_seurat_sct@assays$RNA@counts)
+```
+
+```{r}
+# after removing doublets
+# SCT normalize
+rpe005_seurat_sct = Seurat_SCT_process(rpe005_seurat_sct, seurat_filter = TRUE,
+                                       sample_id = "pan_rpe005", 
+                                       study_name = "pan_et_al")
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe005_seurat_sct =  FindClusters(rpe005_seurat_sct, resolution = 0.5) #Max score is 0.5   
+
+p2_after_QC = DimPlot(rpe005_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("After removing doublets + decontX") + NoAxes()
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe005_after_QC.png", width = 7, height = 8)
+
+FeaturePlot(rpe005_seurat_sct, features = c("MYH11", "CNN1", "TNFRSF11B", "ACTA2", 
+                                            "CRTAC1", "LUM"), order = TRUE,  pt.size = 0.1)
+
+FeaturePlot(rpe005_seurat_sct, features = c("CD68", "CD14", "CD163", "APOE", 
+                                            "S100A8", "IL1B"), order = TRUE,  pt.size = 0.1)
+
+saveRDS(rpe005_seurat_sct, file = "Pan_carotids_scRNA/GSM4705590_pan_rpe005_processed_seurat_obj.rds")
+
+```
+
+# Sample 3: GSM4705591 RPE006 (Caucasian, Female, 76, Asymptomatic)
+
+## Prepare the count matrix
+
+```{r}
+# Load Matrix
+rpe006_matrix = fread("Pan_carotids_scRNA/GSM4705591/GSM4705591_RPE006_matrix.txt", sep="\t", header = TRUE)
+
+rownames(rpe006_matrix) = rpe006_matrix$gene
+head(rownames(rpe006_matrix))
+dim(rpe006_matrix)
+
+# Make sparse matrix and remove "gene" column
+rpe006_sparse_mtx = as.sparse(rpe006_matrix)
+rpe006_sparse_mtx = rpe006_sparse_mtx[, -1]
+
+# 15687 genes x 2767 cells
+dim(rpe006_sparse_mtx)
+```
+
+## Create Seurat obj
+
+```{r}
+# Pre-processing (Create Seurat obj containing doublets)
+# Dims of seurat object: 15445 genes x 2767 cells
+rpe006_seurat_sct = CreateSeuratObject(counts = rpe006_sparse_mtx, 
+                                       project = "pan_rpe006", 
+                                       min.cells = 10, 
+                                       min.features = 200)
+#  before removing doublets
+# SCT normalize
+rpe006_seurat_sct = Seurat_SCT_process(rpe006_seurat_sct, seurat_filter = TRUE,
+                                       sample_id = "pan_rpe006", 
+                                       study_name = "pan_et_al")
+
+###########
+### Finding Best Resolution for integrated object
+
+resolutions_sil_df = calc_sil_scores_for_res(rpe006_seurat_sct, clustering_res = c(0.5, 0.6, 0.7, 0.9, 0.75 ,0.8, 1.0,1.1, 1.4))
+
+max_avg_sil_score(resolutions_sil_df) # 0.6 is Max
+##########
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe006_seurat_sct =  FindClusters(rpe006_seurat_sct, resolution = 0.5)   
+
+# Visualize clusters
+p3_before_QC = DimPlot(rpe006_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("Before removing doublets") + NoAxes()
+
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe006_before_QC.png", width = 7, height = 8)
+
+```
+
+## Detect doublets & ambient RNA
+
+```{r}
+# Detect doublets with scDblFinder
+rpe006_doublet_ids = scDblFinder_clusters(rpe006_seurat_sct, nrep = 3)
+length(rpe006_doublet_ids)
+
+# First filtering step: Use the vector of consensus doublet IDs output below
+rpe006_singlets = setdiff(colnames(rpe006_sparse_mtx), rpe006_doublet_ids)
+length(rpe006_singlets)
+
+# New dims after removing doublets: 15406 genes x 2730 cells
+rpe006_seurat_sct = CreateSeuratObject(counts = rpe006_sparse_mtx[, rpe006_singlets], 
+                                       project = "pan_rpe006", 
+                                       min.cells = 10, 
+                                       min.features = 200)
+
+# Clean counts matrix (without doublets) from ambient RNA using the decontX wrapper
+rpe006_seurat_sct =  decontX_remove(rpe006_seurat_sct)
+head(rpe006_seurat_sct@assays$RNA@counts)
+```
+
+```{r}
+# after removing doublets
+# SCT normalize
+
+rpe006_seurat_sct = Seurat_SCT_process(rpe006_seurat_sct, seurat_filter = TRUE,
+                                       sample_id = "pan_rpe006", 
+                                       study_name = "pan_et_al")
+
+# Finding the right resolution is quite important for doublet detection and removal
+rpe006_seurat_sct =  FindClusters(rpe006_seurat_sct, resolution = 0.5) #Max is 0.5 
+
+p3_after_QC = DimPlot(rpe006_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("After removing doublets + decontX") + NoAxes()
+ggsave(filename = "Pan_carotids_scRNA/Pan_rpe006_after_QC.png", width = 7, height = 8)
+
+FeaturePlot(rpe006_seurat_sct, features = c("MYH11", "CNN1", "TNFRSF11B", "ACTA2", 
+                                            "CRTAC1", "VCAM1"), order = TRUE,  pt.size = 0.1)
+
+FeaturePlot(rpe006_seurat_sct, features = c("CD68", "CD14", "CD163", "APOE", 
+                                            "S100A8", "IL1B"), order = TRUE,  pt.size = 0.1)
+
+saveRDS(rpe006_seurat_sct, file = "Pan_carotids_scRNA/GSM4705591_pan_rpe006_processed_seurat_obj.rds")
+
+```
+

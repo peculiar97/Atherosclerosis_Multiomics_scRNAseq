@@ -1,0 +1,256 @@
+---
+title: "Wirka_homo_scPrep"
+output: html_document
+date: "2024-03-31"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+setwd("Human/")
+
+library(Seurat)
+library(tidyverse)
+library(scDblFinder)
+library(celda)
+library(sctransform)
+library(cluster)
+library(readr)
+source("../scRNA_processing_utils.R") # with the modifications from https://github.com/MillerLab-CPHG/Human_athero_scRNA_meta/blob/main/utils/scRNA_processing_utils.R
+
+# Set seed for doublet removal reproducibility
+set.seed(1)
+```
+
+# Prepare the count matrix
+```{r}
+
+file_path <- "Wirka_coronaries_scRNA/GSE131778_human_coronary_scRNAseq_wirka_et_al_GEO.txt"
+# Read the file
+wirka_sparse_counts <- read.table(file_path, header=TRUE, row.names=1, sep="\t")
+
+# Convert the data frame to a matrix
+wirka_sparse_counts <- as.matrix(wirka_sparse_counts)
+
+#save
+saveRDS(wirka_sparse_counts, "Wirka_coronaries_scRNA/scRNA_raw_sparse_counts.rds")
+
+# Read the Wirka HCA counts matrix
+wirka_sparse_counts = read_rds("Wirka_coronaries_scRNA/scRNA_raw_sparse_counts.rds")
+
+wirka_sparse_counts[1:4, 1:4]
+
+dim(wirka_sparse_counts) # Dims: 20431 genes x 11756 cells
+
+```
+
+# Create Seurat obj
+```{r}
+# Pre-processing (Create Seurat obj containing doublets)
+
+wirka_seurat_sct = CreateSeuratObject(counts = wirka_sparse_counts, 
+                                      project = "wirka_human_coronaries_8patients", 
+                                      min.cells = 10, 
+                                      min.features = 200)
+
+dim(wirka_seurat_sct) # Dims of seurat object: 18194 genes x 11756 cells
+
+# Assign names to the 8 samples that were merged. Sample names are at the very end of
+# each cell barcode
+sample_numbers = stringr::str_sub(rownames(wirka_seurat_sct@meta.data), 
+                                  start = -1)
+sample_ids = paste("wirka", sample_numbers, sep = "_")
+table(sample_ids)
+```
+
+```{r}
+#  before removing doublets
+# SCT normalize
+wirka_seurat_sct = Seurat_SCT_process(wirka_seurat_sct, seurat_filter = TRUE,
+                                      sample_id = sample_ids, 
+                                      study_name = "wirka_et_al")
+###########
+### Finding Best Resolution for integrated object
+
+resolutions_sil_df = calc_sil_scores_for_res(wirka_seurat_sct, clustering_res = c(0.6, 0.7, 0.9, 0.75 ,0.8, 1.0,1.1,  1.4, 1.6))
+
+max_avg_sil_score(resolutions_sil_df) # 0.7 is Max
+##########
+
+wirka_seurat_sct =  FindClusters(wirka_seurat_sct, resolution = 0.9) 
+
+# Visualize clusters
+p1_before_QC = DimPlot(wirka_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("Before removing doublets") + NoAxes()
+```
+
+# Detect doublets & ambient RNA
+```{r}
+# Detect doublets with scDblFinder
+wirka_doublet_ids = scDblFinder_clusters(wirka_seurat_sct, nrep = 3)
+length(wirka_doublet_ids)
+
+# First filtering step: Use the vector of consensus doublet IDs output below
+wirka_singlets = setdiff(colnames(wirka_sparse_counts), wirka_doublet_ids)
+length(wirka_singlets)
+
+# New dims after removing doublets: 18059 genes x   11199 cells
+wirka_seurat_sct = CreateSeuratObject(counts = wirka_sparse_counts[, wirka_singlets], 
+                                      project = "wirka_human_coronaries_8patients", 
+                                      min.cells = 10, 
+                                      min.features = 200)
+
+# Clean counts matrix (without doublets) from ambient RNA using the decontX wrapper
+wirka_seurat_sct =  decontX_remove(wirka_seurat_sct)
+head(wirka_seurat_sct@assays$RNA@counts)
+
+sample_numbers = stringr::str_sub(rownames(wirka_seurat_sct@meta.data), 
+                                  start = -1)
+sample_ids = paste("wirka_coronary", sample_numbers, sep = "_")
+table(sample_ids)
+
+```
+
+```{r}
+# after removing doublets
+# SCT normalize
+wirka_seurat_sct = Seurat_SCT_process(wirka_seurat_sct, seurat_filter = TRUE,
+                                      sample_id = sample_ids, 
+                                      study_name = "wirka_et_al")
+
+# Finding the right resolution is quite important for doublet detection and removal
+wirka_seurat_sct =  FindClusters(wirka_seurat_sct, resolution = 0.9)
+
+p2_after_QC = DimPlot(wirka_seurat_sct, reduction = "umap", label = TRUE) +
+  ggtitle("After removing doublets + decontX") + NoAxes()
+
+FeaturePlot(wirka_seurat_sct, features = c("MYH11", "CNN1", "TNFRSF11B", "ACTA2", 
+                                           "CRTAC1", "LUM"), order = TRUE, pt.size = 0.1)
+FeaturePlot(wirka_seurat_sct, features = c("MYH11", "TNFRSF11B", "CRTAC1", "KRT17", "VCAM1", "FHL5"), order = TRUE,  pt.size = 0.1)
+
+DimPlot(wirka_seurat_sct, group.by = "sample")
+
+FeaturePlot(wirka_seurat_sct, features = c("CD68", "CD14", "LYZ", "APOE", 
+                                           "S100A8", "IL1B"), order = TRUE,  pt.size = 0.1)
+
+FeaturePlot(wirka_seurat_sct, features = c("CD68", "CD3G", "LYZ", "S100A9", 
+                                           "S100A8", "IL1B"), order = TRUE,  pt.size = 0.1)
+
+saveRDS(wirka_seurat_sct, "Wirka_coronaries_scRNA/wirka_human_coronaries_processed_seurat_obj.rds")
+```
+## Testing decontX
+```{r}
+wirka_sce = as.SingleCellExperiment(wirka_seurat_sct)
+wirka_sce_decontX = celda::decontX(wirka_sce)
+umap = reducedDim(wirka_sce_decontX, "decontX_UMAP")
+plotDimReduceCluster(x = wirka_sce_decontX$decontX_clusters,
+                     dim1 = umap[, 1], dim2 = umap[, 2])
+plotDecontXContamination(wirka_sce_decontX)
+```
+
+# Annotation
+## Manual
+```{r}
+wirka_seurat_sct = readRDS("Wirka_coronaries_scRNA/wirka_human_coronaries_processed_seurat_obj.rds")
+
+DefaultAssay(wirka_seurat_sct) = "SCT"
+
+wirka_seurat_sct = PrepSCTFindMarkers(wirka_seurat_sct)
+coronary_markers = FindAllMarkers(wirka_seurat_sct,
+                                 logfc.threshold = 1, 
+                                 only.pos = TRUE,
+                                 min.pct = 0.25)
+# The file is taken from https://ars.els-cdn.com/content/image/1-s2.0-S0002929723000976-mmc2.xlsx
+# Table S5. Cell type marker genes for 79 human cell types based on scRNA-Seq expression profiles (https://www.proteinatlas.org/about/download). For each cell type, top 500 genes are ranked in descending order of importance.
+
+# Prepare
+cell_markers_S5 = readxl::read_xlsx("../ord_et_al_GSE205930/1-s2.0-S0002929723000976-mmc2.xlsx", sheet = 5, skip = 2)
+
+cell_markers_S5 <- cell_markers_S5 %>%
+  unnest(Genes) %>%
+  separate_rows(Genes, sep = " ")
+ 
+# Reshape the data frame
+homo_cell_markers <- cell_markers_S5 %>%
+  group_by(`Cell type`) %>%
+  mutate(row = row_number()) %>%
+  spread(`Cell type`, Genes) %>% dplyr::select(-row)
+
+wirka_seurat_sct = AddModuleScore(wirka_seurat_sct, features = list(homo_cell_markers$Smooth_muscle_cells,
+                                          homo_cell_markers$Endothelial_cells,
+                             homo_cell_markers$Fibroblasts, homo_cell_markers$Macrophages,
+                            homo_cell_markers$`NK-cells`, homo_cell_markers$`T-cells`), name = c("Smooth_muscle_cells", "Endothelial_cells" ,"Fibroblasts", "Macrophages", "NK-cells", "T-cells"))
+
+
+```
+
+## sc-type
+```{r}
+
+# Cell Annotation using sc-type
+# It seems it is more adopted for homo sapiens.
+# https://www.nature.com/articles/s41467-022-28803-w
+
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# DB file
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue = "Immune system" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+tissue = "Muscle"
+
+##########################Mouse (a solution from a user)
+# From https://github.com/IanevskiAleksandr/sc-type/issues/4
+db_ = "https://github.com/IanevskiAleksandr/sc-type/files/12363488/sc_type_mouse_alltumours.xlsx"
+tissue = "All"
+##########################
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+sctype_test = wirka_seurat_sct
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = sctype_test[["SCT"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(sctype_test@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(sctype_test@meta.data[sctype_test@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(sctype_test@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+sctype_test@meta.data$customclassif = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  sctype_test@meta.data$customclassif[sctype_test@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')        
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif', split.by = "sample")
+
+p1 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')
+p2 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'manual_annotations') + NoLegend()
+plot_grid(p1, p2, nrow = 2)
+
+
+# load auto-detection function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/auto_detect_tissue_type.R")
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+
+# guess a tissue type
+tissue_guess = auto_detect_tissue_type(path_to_db_file = db_, seuratObject = sctype_test, scaled = TRUE, assay = "SCT")  # if scaled = TRUE, make sure the data is scaled, as seuratObject[[assay]]@scale.data is used. If you just created a Seurat object, without any scaling and normalization, set scaled = FALSE, seuratObject[[assay]]@counts will be used
+
+```
+

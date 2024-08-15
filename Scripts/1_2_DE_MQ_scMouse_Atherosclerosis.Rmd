@@ -1,0 +1,216 @@
+---
+title: "DE_MQ_SM_scMouseAT"
+output: html_document
+date: "2024-03-14"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Gene Set
+```{r}
+up_list_integ = readRDS(file = "/shared_home/my_analysis/ChipSeeker/BETA/up_list_df_Integrative.rds")
+
+```
+
+
+
+# DESeq2 method:Condition-specific
+
+## MQ
+*Differentially Expressed Genes in Macrophage Population based on the Condition*
+
+-   The goal is to assess the differential gene expression, restricted to **Macrophage Population**.
+
+-   To find differentially expressed genes, DESeq2 method were implemented on [ZINB-adjusted expression data](https://www.nature.com/articles/s41467-017-02554-5), filtered based on padj < 0.05 & abs(log2FoldChange) > 0.25.
+
+```{r echo=FALSE, eval=FALSE}
+
+# Macrophage: DESeq2 Analysis using ZINB-WaVE
+
+library(BiocParallel)
+library(DESeq2)
+
+BiocParallel::register(SerialParam())
+
+seurat_integ_annotd = readRDS(file = "ord_et_al_GSE205930/sorted_data/seurat_integ_annotd_0.rds")
+
+DefaultAssay(seurat_integ_annotd) = "SCT"
+
+###########################
+mq_subset = subset(seurat_integ_annotd, idents = c("Macrophage"))
+DimPlot(mq_subset, label = T, group.by = "manual_annotations", repel = T, split.by = "disease_status") & NoLegend() & NoAxes()
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNo_correction/MQ_with_disease.pdf", 
+        width = 8.5, height = 9)
+
+###########################
+sctype_test = readRDS(file = "ord_et_al_GSE205930/sorted_data/sctype_0.rds")
+DefaultAssay(sctype_test) = "SCT"
+Idents(sctype_test) = "sctype_immune"
+
+#ISG expressing immune cells:: IFIT1,IFIT2,IFIT3,IFIT5,ISG15,CCL3,CCL4,CCL3L3,RSAD2,OASL,CXCL10,IFI15,ISG20
+#Non-classical monocytes:: CD14,CD16,CD11b,CD68,HLA-DR,CD33,CD11c,CD123,CD15,CD3D,CD3E,CD3G,CD3Z,CD66b,FCGR3A,CDKN1C,LST1,FCER1G,MS4A7,RHOC,S100A8,S100A9,CST3,C1QC
+mq_subset = subset(sctype_test, idents = c("ISG expressing immune cells", "Non-classical monocytes"))
+DimPlot(mq_subset, label = T, group.by = "sctype_immune", repel = T, split.by = "disease_status") & NoLegend() & NoAxes()
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNo_correction/MQ_Subs_with_disease.pdf", 
+        width = 8.5, height = 9)
+
+mq_subset = subset(sctype_test, idents = c("ISG expressing immune cells"))
+DimPlot(mq_subset, label = T, group.by = "sctype_immune", repel = T, split.by = "disease_status") & NoLegend() & NoAxes()
+
+
+# Find variable features
+DefaultAssay(mq_subset) = "RNA"
+mq_subset = NormalizeData(mq_subset,
+                                   normalization.method = "LogNormalize",
+                                   scale.factor = 10000)
+mq_subset = FindVariableFeatures(mq_subset, 
+                                          selection.method = "vst",
+                                          nfeatures = 3000, assay = "RNA")
+
+mq_subset_var_features = mq_subset@assays$RNA@var.features
+
+saveRDS(mq_subset, file = "ord_et_al_GSE205930/DE_Cell_Specific/mq_subset_normalized_0.rds")
+
+# Make SingleCellExperiment object
+mq_subset_se = Seurat::as.SingleCellExperiment(mq_subset)
+
+class(mq_subset_se)
+
+mq_subset_se_var_feats = mq_subset_se[mq_subset_var_features,]
+
+
+# Model zero component using ZINB-WaVE
+
+# Filter out lowly expressed genes by removing genes that
+# do not have at least 5 reads in at least 5 samples
+keep = rowSums(assay(mq_subset_se_var_feats) >= 5) >= 5
+
+table(keep)
+mq_subset_se_filtered = mq_subset_se_var_feats[keep,]
+
+
+# Make sure that input counts matrix is of class matrix
+assay(mq_subset_se_filtered) = round(as.matrix(assay(mq_subset_se_filtered)))
+mq_subset_se_filtered
+
+mq_subset_zinb = zinbwave(mq_subset_se_filtered, K=0, 
+                           observationalWeights=TRUE,
+                           X = "~ disease_status",
+                           BPPARAM=SerialParam())
+
+saveRDS(mq_subset_zinb ,file = "ord_et_al_GSE205930/sorted_data/mq_subset_zinb_0.rds")
+
+table(mq_subset_zinb@colData$disease_status)
+
+# Run DE analysis
+dds = DESeq2::DESeqDataSet(mq_subset_zinb,
+                   design = ~ disease_status)
+
+# Re factor lesion categories
+dds@colData$disease_status = factor(dds@colData$disease_status, 
+                                   levels = c("Control", "Pre_lesion", "Early_disease", "Late_disease"))
+
+# Estimate size factors
+dds = estimateSizeFactors(dds, type="poscounts")
+
+# Need to set the right parameters for single cell analysis
+dds = DESeq(dds, test="LRT", minmu = 1e-6, 
+            useT=FALSE,
+            reduced=~1, 
+            minReplicatesForReplace = Inf)
+
+saveRDS(dds, file = "ord_et_al_GSE205930/DE_Cell_Specific/dds_mq_0.rds")
+
+```
+
+### Late disease vs Control
+
+```{r echo=FALSE, cache=TRUE}
+#"Non-classical monocytes"
+dds = readRDS(file = "ord_et_al_GSE205930/DE_Cell_Specific/dds_mq_0_NCM.rds")
+
+#"ISG expressing immune cells"
+dds = readRDS(file = "ord_et_al_GSE205930/DE_Cell_Specific/dds_mq_0_ISG.rds")
+
+# whole MQ
+dds = readRDS(file = "ord_et_al_GSE205930/DE_Cell_Specific/dds_mq_0.rds")
+
+
+##########LD vs Ct
+res_Ct_Mt_3m_HFD = DESeq2::results(dds, contrast = c("disease_status",
+                                        "Late_disease", "Control"))
+
+res_Ct_Mt_3m_HFD_df = as.data.frame(res_Ct_Mt_3m_HFD)
+res_Ct_Mt_3m_HFD_df$gene = rownames(res_Ct_Mt_3m_HFD_df)
+
+# Set threshold for filtering (FDR < 0.05 and log2FC > 0.25)
+res_CT_LD = res_Ct_Mt_3m_HFD_df %>%
+  dplyr::filter(padj < 0.05 & abs(log2FoldChange) > 0.25 ) %>%
+  arrange(desc(log2FoldChange))
+
+dim(res_CT_LD)
+
+#https://ggrepel.slowkow.com/articles/examples.html#options ggrepel options
+##Volcano
+# Non-classical monocytes
+res_CT_LD %>%
+  dplyr::filter(abs(log2FoldChange) < 5) %>%
+  ggplot(aes(x=log2FoldChange, y=-log10(padj), label= gene, color = ifelse(log2FoldChange > 0.25, "#4575b4", "#d73027"))) + 
+  geom_point(size = 0.3, alpha= 0.2) +
+  #geom_quasirandom(groupOnX=FALSE, size = 0.5) + #From ggbeeswarm package
+  geom_vline(xintercept = c(-0.25, 0.25), color="black", linetype="dashed") + 
+  geom_hline(yintercept = -log10(5e-2), color="black", linetype="dashed") + 
+  geom_text_repel(data = . %>% filter(gene %in% up_list_integ$SYMBOL), size = 2.3,
+                 box.padding = 0.09, force = 0.08, force_pull = 0, max.overlaps = Inf,             min.segment.length = Inf, max.iter = 1e4) +
+  theme_classic() + theme(legend.position = "none") + 
+  labs(title = "Non-classical monocytes")
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/volcano_mMQ_NCM_res.png", 
+        width = 6.4, height = 4)
+
+
+res_CT_LD %>%
+  dplyr::filter(abs(log2FoldChange) < 5) %>%
+  ggplot(aes(x=log2FoldChange, y=-log10(padj), label= gene, color = ifelse(log2FoldChange > 0.25, "#4575b4", "#d73027"))) + 
+  geom_point(size = 0.3, alpha= 0.2) +
+  #geom_quasirandom(groupOnX=FALSE, size = 0.5) + #From ggbeeswarm package
+  geom_vline(xintercept = c(-0.25, 0.25), color="black", linetype="dashed") + 
+  geom_hline(yintercept = -log10(5e-2), color="black", linetype="dashed") + 
+  geom_text_repel(data = . %>% filter(gene %in% up_list_integ$SYMBOL), size = 2.3,
+                 box.padding = 0.09, force = 0.04, force_pull = 0, max.overlaps = Inf,             min.segment.length = Inf, max.iter = 1e4) +
+  theme_classic() + theme(legend.position = "none") +  
+  labs(title = "ISG expressing immune cells")
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/volcano_mMQ_ISG_res.png", 
+        width = 6.4, height = 4)
+
+# Arrange Plots
+#mq_NCM + mq_ISG + plot_layout(ncol = 1, guides = "collect")
+#ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/volcano_Mus_MQ_test.png", width = 9.3, height = 6.9)
+
+#pdf(file = "ord_et_al_GSE205930/Figures/CellNum_correction/volcano_Mus_MQ_test.pdf", width = 9.3, height = 6.9)
+
+#mq_NCM + mq_ISG + plot_layout(ncol = 1, guides = "collect")
+
+#dev.off()
+
+ids_CT_LD = data.frame(symbol = res_CT_LD %>% arrange(desc(log2FoldChange)) %>% pull(gene))
+ids_CT_LD$ENTREZID = mapIds(org.Mm.eg.db, keys = res_CT_LD %>% arrange(desc(log2FoldChange)) %>% pull(gene), keytype = "SYMBOL", column = "ENTREZID", multiVals = "first")
+mq_CT_LD_kegg = enrichKEGG(ids_CT_LD$ENTREZID, organism = "mmu")
+
+par(mfrow = c(1, 1), mar = c(6, 20, 2, 1))
+barplot(height = -log10(mq_CT_LD_kegg@result$p.adjust)[20:1], names.arg = mq_CT_LD_kegg@result$Description[20:1],
+    horiz = TRUE, las = 1, border = FALSE, cex.names = 0.65, xlab = "-log10(P.adjust)", main = "KEGG Analysis")
+abline(v = c(-log10(0.05)), lty = 2)
+abline(v = 0, lty = 1)
+
+
+mq_subset = readRDS(file = "ord_et_al_GSE205930/DE_Cell_Specific/mq_subset_normalized.rds")
+mq_subset = ScaleData(mq_subset, assay = "RNA")
+DoHeatmap(mq_subset, features = res_CT_LD %>% arrange(desc(log2FoldChange)) %>% pull(gene),  assay = "RNA", size = 4, angle = 90, group.by = "sample") 
+
+DotPlot(mq_subset, features = res_CT_LD %>% arrange(desc(log2FoldChange)) %>% pull(gene),  assay = "RNA", group.by = "sample") + RotatedAxis() + ggtitle("The expression pattern of top 10 genes from pairwaise comparisons") + theme(plot.title = element_text(face = "bold", size = 14))
+
+```
+

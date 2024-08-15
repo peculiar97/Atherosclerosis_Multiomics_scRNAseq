@@ -1,0 +1,838 @@
+---
+title: "Integration_Pan_wirka"
+output: html_document
+date: "2024-04-06"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+setwd("Human/")
+
+library(Seurat)
+library(SeuratDisk)
+library(anndata) # for handling annotated data matrices in memory and on disk
+library(zellkonverter) # or converting between SingleCellExperiment objects and alternative objects(such as AnnData)
+library(Matrix)
+library(harmony)
+library(rliger)
+library(tidyverse)
+library(data.table)
+library(cluster)
+library(RColorBrewer)
+library(parallel)
+library(reticulate)
+library(UCell)
+library(dplyr)
+library(cowplot)
+
+source("../scRNA_processing_utils.R") # with the modifications from https://github.com/MillerLab-CPHG/Human_athero_scRNA_meta/blob/main/utils/scRNA_processing_utils.R
+
+#we know that the output can generate large R objects/variables in terms of memory. 
+#If we have a large dataset, then we might need to adjust the limit for allowable object sizes within R (Default is 500 * 1024 ^ 2 = 500 Mb) using the following code:
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+
+# Set seed for reproducibility
+set.seed(1)
+```
+# Prepare a list
+```{r}
+# Load SCTransform processed datasets 
+
+# Load Pan et al data
+pan_rpe004 = read_rds("Pan_carotids_scRNA/GSM4705589_pan_rpe004_processed_seurat_obj.rds")
+pan_rpe005 = read_rds("Pan_carotids_scRNA/GSM4705590_pan_rpe005_processed_seurat_obj.rds")
+pan_rpe006 = read_rds("Pan_carotids_scRNA/GSM4705591_pan_rpe006_processed_seurat_obj.rds")
+
+# Load Wirka et al
+wirka_hca = read_rds("Wirka_coronaries_scRNA/wirka_human_coronaries_processed_seurat_obj.rds")
+
+# Load Hu et al data
+
+hu_coronary2_p2 = read_rds("Hu_coronaries_aortas_pulmonary/hu_coronary2_p2_processed_seurat_obj.rds")
+
+hu_coronary2_p3 = read_rds("Hu_coronaries_aortas_pulmonary/hu_coronary2_p3_processed_seurat_obj.rds")
+
+
+rpca_obj_list = list(rpe004 = pan_rpe004,
+                     rpe005 = pan_rpe005,
+                     rpe006 = pan_rpe006,
+                     wirka_hca = wirka_hca,
+                     hu_coronary2_p2 = hu_coronary2_p2,
+                     hu_coronary2_p3 = hu_coronary2_p3)
+######
+saveRDS(rpca_obj_list, file = "pan_wirka_hu2/Integration_Objs/pan_wirka_hu_seurat_list_for_int.rds")
+```
+
+# Integration
+```{r}
+
+# Generate list of highly variable genes across datasets that will be used for integration 
+rpca_features_sct = SelectIntegrationFeatures(rpca_obj_list, nfeatures = 3000)
+rpca_obj_list = PrepSCTIntegration(rpca_obj_list, anchor.features = rpca_features_sct)
+rpca_obj_list = lapply(rpca_obj_list, FUN = function(x) {
+  x = RunPCA(x, features=rpca_features_sct)
+}) 
+
+# rpca method is used 
+rpca_sct_anchors = FindIntegrationAnchors(object.list = rpca_obj_list, 
+                                          normalization.method = "SCT",
+                                          anchor.features = rpca_features_sct, 
+                                          dims = 1:30, 
+                                          reduction = "rpca",
+                                          k.anchor = 5)
+#Takes time
+rpca_int_sct = IntegrateData(anchorset = rpca_sct_anchors, 
+                             normalization.method = "SCT",
+                             dims=1:30)
+
+
+#saveRDS(rpca_int_sct, file = "pan_wirka_hu2/Integration_Objs/rpca_int_sct.rds")
+```
+
+# Post-Integration
+## Clustering&Adding metadata
+```{r}
+# Run PCA and UMAP on integrated object (default is now integrated object)
+rpca_int_sct = read_rds(file = "Integration_Objs/rpca_int_sct.rds")
+
+DefaultAssay(rpca_int_sct) = "integrated"
+
+# Run standard workflow for dimensionality reduction and clustering
+# 30 dims captures really most of the variation in the data
+rpca_int_sct = RunPCA(rpca_int_sct) 
+rpca_int_sct = FindNeighbors(rpca_int_sct, reduction = "pca", dims = 1:30, k.param = 20)
+
+rpca_int_sct = RunUMAP(rpca_int_sct, dims = 1:30, n.neighbors = 30, min.dist = 0.3) 
+
+###########It gave Error (https://github.com/crazyhottommy/scclusteval/issues/6)#########
+### Finding Best Resolution for integrated object
+res = c(0.8, 0.9, 1, 1.1, 1.2, 1.3)
+scores_list = list()
+dist_matrix = dist(x = Embeddings(object = rpca_int_sct[["pca"]])[, 1:30]) # Takes time
+dim(dist_matrix)
+
+# Switch back to "integrated" assay to cluster at different resolutions
+for (i in seq_along(res)) {
+  # Cluster data
+  rpca_int_sct = FindClusters(rpca_int_sct, resolution = res[i])
+  
+  # Calculate silhouette scores
+  scores_list[[i]] = calc_sil_scores(rpca_int_sct, dist_matrix)
+  names(scores_list)[[i]] = paste("res", as.character(res[i]), sep = "_")
+}
+
+# Create a single df with all the sil scores for the tested resolutions
+# Max res
+resolutions_sil_df = rbindlist(scores_list, idcol = TRUE)
+resolutions_sil_df$method = "rPCA"
+dim(resolutions_sil_df)
+head(resolutions_sil_df)
+
+max_avg_sil_score(resolutions_sil_df) #Max is 1
+############################################################
+
+# A resolution of 1 seems appropriate based on previous silhouette analysis 
+rpca_int_sct = FindClusters(rpca_int_sct, resolution = 1)
+
+###Update Metadata
+metadata_df = rpca_int_sct@meta.data
+dim(metadata_df)
+
+# Group cells by artery of origin
+carotids = c("pan_et_al")
+coronaries = c("wirka_et_al", "hu_et_al")
+
+# Group cells by disease status of sample
+lesion = c("pan_et_al", "wirka_et_al")
+non_lesion = c("hu_et_al")
+
+
+males = c("pan_rpe004", "pan_rpe005", "wirka_coronary_1", "wirka_coronary_2", "wirka_coronary_3",
+          "wirka_coronary_4", "wirka_coronary_5", "wirka_coronary_6", "wirka_coronary_7", 
+          "hu_coronary2_p2")
+
+females = c("pan_rpe006", "wirka_coronary_8", "hu_coronary2_p3")
+
+# Add new metadata cols and cell barcodes as rownames.
+# Not sure why cell barcodes are removed when we create the new variables
+new_meta_df  = metadata_df %>% 
+  mutate(arterial_origin = case_when(study %in% carotids ~ "carotid",
+                                     study %in% coronaries ~ "coronary"),
+         sample_disease_status = case_when(study %in% lesion ~ "lesion",
+                                           study %in% non_lesion ~ "non_lesion"),
+         sex = case_when(sample %in% males ~ "males",
+                         sample %in% females ~ "females"))
+rownames(new_meta_df) = rownames(rpca_int_sct@meta.data)
+head(new_meta_df)
+
+rpca_int_sct@meta.data = new_meta_df
+
+rpca_int_sct@meta.data$study = factor(rpca_int_sct@meta.data$study,
+                                         levels = c("pan_et_al", "wirka_et_al", "hu_et_al"))
+
+#rpca_int_sct@meta.data$sample_disease_status = factor(rpca_int_sct@meta.data$sample_disease_status,
+#                                                      levels = c("lesion", "non_lesion"))
+
+
+#saveRDS(rpca_int_sct, "pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered.rds")
+```
+
+# Annotation
+- CNN1: This marker is associated with smooth muscle cells (SMCs) that have a more contractile phenotype. 
+- ACTA2: This marker is also associated with SMCs.
+- IL1B: This is a pro-inflammatory cytokine that is elevated in unstable atherosclerotic plaques.
+- APOE: This gene is also upregulated in unstable atherosclerotic plaques. APOE plays a role in cholesterol metabolism and is associated with macrophage and foam cell function in the plaque.
+- NKG7: is a marker that is highly expressed in natural killer (NK).
+- CD3E: is a marker that is expressed on T cells.
+## Tabula Sapiens reference
+### TS Whole
+```{r}
+#############################Did NOT work!!##############
+# Convert h5ad Tabula Sapiens file to h5Seurat
+SeuratDisk::Convert("Annotation_Refs/Tabula_Sapiens/TabulaSapiens.h5ad",
+                    dest = "Annotation_Refs/Tabula_Sapiens/TabulaSapiens.h5seurat",
+                    overwrite=TRUE,
+                    verbose=TRUE)
+
+# Connect to h5seurat file
+ts_file = SeuratDisk::Connect("Annotation_Refs/Tabula_Sapiens/TabulaSapiens.h5seurat")
+ts_file
+
+# Look at summary of the data stored within the h5seurat object. 
+ts_file$index()
+ts_seurat_obj = LoadH5Seurat("Annotation_Refs/Tabula_Sapiens/TabulaSapiens.h5seurat",
+                             assays="RNA")
+saveRDS(ts_seurat_obj, "Annotation_Refs/Tabula_Sapiens/Tabula_sapiens_whole_seurat_obj.rds")
+##########################################################
+
+### This solution worked: h5ad>SCE>Seurat
+#https://github.com/mojaveazure/seurat-disk/issues/109
+
+ts_all = readH5AD(file = "Annotation_Refs/Tabula_Sapiens/TabulaSapiens.h5ad", verbose = T)
+#saveRDS(ts_all, file = "Annotation_Refs/Tabula_Sapiens/TS_All.rds")
+
+ts_seurat_obj = as.Seurat(ts_all, counts = "X", data = NULL)
+#saveRDS(ts_seurat_obj, "Annotation_Refs/Tabula_Sapiens/Tabula_sapiens_whole_seurat_obj.rds")
+
+###
+
+# Dims of TS entire reference: 58870 483152 
+ts_seurat_obj
+DimPlot(ts_seurat_obj, label = FALSE, repel = TRUE, reduction = "X_umap", raster = F)
+FeaturePlot(ts_seurat_obj, features = c("MYH11"), raster = FALSE)
+```
+### TS Immune
+```{r}
+ts_immune = readH5AD(file = "Annotation_Refs/Tabula_Sapiens/TS_immune.h5ad", verbose = T)
+#saveRDS(ts_immune, file = "Annotation_Refs/Tabula_Sapiens/TS_Immune.rds")
+
+ts_immune_seurat = as.Seurat(ts_immune, counts = "X", data = NULL)
+#saveRDS(ts_immune_seurat, "Annotation_Refs/Tabula_Sapiens/Tabula_sapiens_immune_seurat_obj.rds")
+
+DimPlot(ts_immune_seurat, label = TRUE, group.by = "cell_ontology_class", raster = FALSE, repel = TRUE, label.size = 3.5) + custom_theme +
+  theme(legend.position = "none")
+DimPlot(ts_immune_seurat, raster = F)
+table(ts_immune_seurat@meta.data$organ_tissue)
+table(ts_immune_seurat@meta.data$cell_ontology_class)
+
+# Since we have 200k cells, it might be better to subset to relevant tissues before SCTransform re-normalizing
+relevant_tissues = c("Blood", "Bone_Marrow", "Vasculature", "Thymus")
+TS_immune_tissue_subset = subset(ts_immune_seurat, subset = organ_tissue %in% relevant_tissues)
+
+# Normalize data using SCTransform prior to label transfer so that reference and input datasets are normalized in the same manner
+# NOTE: Looks that for FindTransferAnchors to work both reference and query datasets have to be normalized using the same approach.
+# Alternative solution: SCTransform tabula sapiens data. Cluster topology should fairly similar
+# SCTransform normalize prior to running label transfer workflow
+TS_immune_tissue_subset = SCTransform(TS_immune_tissue_subset, assay = "originalexp" ,vst.flavor = "v2")
+TS_immune_tissue_subset =  RunPCA(TS_immune_tissue_subset) %>% 
+  FindNeighbors(reduction = "pca", dims = 1:30, k.param = 20) %>%
+  RunUMAP(dims = 1:30, n.neighbors = 30) 
+TS_immune_tissue_subset = FindClusters(TS_immune_tissue_subset, resolution = 1)
+
+# Save TS immune subset for Blood, Bone Marrow and Vasculature
+#saveRDS(TS_immune_tissue_subset, "Annotation_Refs/Tabula_Sapiens/TS_immune_seurat_obj_Blood_BM_Vasc_Thymus_SCT.rds")
+TS_immune_tissue_subset = read_rds("Annotation_Refs/Tabula_Sapiens/TS_immune_seurat_obj_Blood_BM_Vasc_Thymus_SCT.rds")
+
+# Plot SCT re-normalized data 
+DimPlot(TS_immune_tissue_subset, label = TRUE, group.by = "cell_ontology_class", raster = FALSE, repel = TRUE) + custom_theme +
+  theme(legend.position = "none") +
+  ggtitle("TS immune for Blood, Bone marrow, Thymus and Vasculature")
+FeaturePlot(TS_immune_tissue_subset, features = c("IL1B", "NKG7","APOE", "CD3E"), order = TRUE) & new_scale & custom_theme
+
+```
+
+#### Label Transfer
+```{r}
+# Transfer labels from TS subsets to meta-analyzed data
+# From Seurat issue 3937: As of now, you can only run our transfer workflow with normalization.method = SCT when both query and reference have been SCTransformed.
+
+# Before transferring anchors, make sure that the default assay of the integrated reference is set to SCT
+DefaultAssay(rpca_int_sct) = "SCT"
+
+transfer_anchors_immune = FindTransferAnchors(reference = TS_immune_tissue_subset, query = rpca_int_sct, dims = 1:30, reference.reduction = "pca",  normalization.method = "SCT")
+
+immune_predictions = TransferData(anchorset = transfer_anchors_immune, refdata = TS_immune_tissue_subset$cell_ontology_class, dims = 1:30)
+
+ts_immune_predictions = immune_predictions %>%
+  dplyr::select(predicted.id, prediction.score.max) %>%
+  rename(TS_immune_predicted_id = predicted.id,
+         TS_immune_prediction_score_max = prediction.score.max)
+
+rpca_int_sct_v1 = AddMetaData(rpca_int_sct, metadata = ts_immune_predictions)
+table(rpca_int_sct_v1$TS_immune_predicted_id)
+
+# Plot transferred labels
+DimPlot(rpca_int_sct_v1, label = TRUE, group.by = "TS_immune_predicted_id", raster = FALSE, repel = TRUE) + custom_theme + 
+  ggtitle("Predicted ID from TS immune") +
+  theme(legend.position = "bottom")
+
+ggplot(rpca_int_sct_v1@meta.data, aes(x=TS_immune_prediction_score_max)) + geom_histogram(bins = 70) + custom_theme + 
+  ggtitle("Prediction scores from TS immune") +
+  xlab("Prediction scores from TS immune") +
+  ylab("Cell number")
+
+rpca_int_sct_v1@meta.data %>%
+  filter(TS_immune_predicted_id == "macrophage") %>%
+  ggplot(aes(x=TS_immune_prediction_score_max)) + geom_histogram(bins=50) + custom_theme
+
+# Plot transferred labels to Wirka hca data
+DimPlot(rpca_int_sct_v1, label = TRUE, group.by = "predicted.id", raster = FALSE, repel = TRUE) + custom_theme + 
+  ggtitle("Predicted ID from TS immune of Blood, Bone Marrow and Vasculature") +
+  theme(legend.position = "bottom")
+ggplot(rpca_int_sct_v1@meta.data, aes(x=prediction.score.max)) + geom_histogram(bins = 70) + custom_theme +
+  ggtitle("prediction scores from TS immune subset (Blood, Bone marrow, Vasculature)")
+```
+
+
+### TS vasculature
+```{r}
+ts_vasculature = readH5AD(file = "Annotation_Refs/Tabula_Sapiens/TS_Vasculature.h5ad", verbose = T)
+saveRDS(ts_vasculature, file = "Annotation_Refs/Tabula_Sapiens/TS_Vasculature.rds")
+
+ts_vasculature_seurat = as.Seurat(ts_vasculature, counts = "X", data = NULL)
+#saveRDS(ts_vasculature_seurat, "Annotation_Refs/Tabula_Sapiens/Tabula_sapiens_vasculature_seurat_obj.rds")
+
+ts_vasculature_seurat = readRDS("Annotation_Refs/Tabula_Sapiens/Tabula_sapiens_vasculature_seurat_obj.rds")
+
+table(ts_vasculature_seurat@meta.data$cell_ontology_class)
+DimPlot(ts_vasculature_seurat, label = TRUE, group.by = "cell_ontology_class", raster = FALSE, repel = TRUE, label.size = 3.5) + custom_theme + 
+  theme(legend.position = "none")
+FeaturePlot(ts_vasculature_seurat, features = c("CNN1", "ACTA2","IL1B", "APOE"), order = TRUE) & new_scale & custom_theme
+
+# Normalize data using SCTransform prior to label transfer so that reference and input datasets are normalized in the same manner
+ts_vasculature_seurat = SCTransform(ts_vasculature_seurat, assay = "originalexp" ,vst.flavor = "v2")
+ts_vasculature_seurat =  RunPCA(ts_vasculature_seurat) %>% 
+  FindNeighbors(reduction = "pca", dims = 1:30, k.param = 20) %>%
+  RunUMAP(dims = 1:30, n.neighbors = 30) 
+ts_vasculature_seurat = FindClusters(ts_vasculature_seurat, resolution = 1)
+
+# Save TS vasculature subset
+saveRDS(ts_vasculature_seurat, "Annotation_Refs/Tabula_Sapiens/TS_vasculature_seurat_obj_SCT.rds")
+
+ts_vasculature_seurat = read_rds("Annotation_Refs/Tabula_Sapiens/TS_vasculature_seurat_obj_SCT.rds")
+
+# Plot SCT re-normalized data 
+DimPlot(ts_vasculature_seurat, label = TRUE, group.by = "cell_ontology_class", raster = FALSE, repel = TRUE) + custom_theme
+FeaturePlot(ts_vasculature_seurat, features = c("CNN1", "ACTA2","IL1B", "APOE"), order = TRUE) & new_scale & custom_theme
+
+```
+
+#### Label Transfer
+```{r}
+# Before transferring anchors, make sure that the default assay of the integrated reference is set to SCT
+DefaultAssay(rpca_int_sct_v1) = "SCT"
+
+# Find transfer anchors for TS vasculature
+transfer_anchors_vasc = FindTransferAnchors(reference = ts_vasculature_seurat, query = rpca_int_sct_v1, dims = 1:30, reference.reduction = "pca",   normalization.method = "SCT")
+
+vasc_predictions = TransferData(anchorset = transfer_anchors_vasc, 
+                           refdata = ts_vasculature_seurat$cell_ontology_class, 
+                           dims = 1:30)
+
+ts_vasc_predictions = vasc_predictions %>%
+  dplyr::select(predicted.id, prediction.score.max) %>%
+  rename(TS_vasc_predicted_id = predicted.id,
+         TS_vasc_prediction_score_max = prediction.score.max)
+  
+rpca_int_sct_v1 = AddMetaData(rpca_int_sct_v1, metadata = ts_vasc_predictions)
+
+# Plot transferred labels to Wirka hca data
+DimPlot(rpca_int_sct_v1, label = TRUE, group.by = "TS_vasc_predicted_id", raster = FALSE, repel = TRUE) + custom_theme + 
+  ggtitle("Predicted ID from TS vasculature") +
+  theme(legend.position = "bottom")
+ggplot(rpca_int_sct_v1@meta.data, aes(x=TS_vasc_prediction_score_max)) + geom_histogram(bins = 70) + custom_theme + 
+  ggtitle("Prediction scores from TS vasculature") +
+  xlab("Prediction scores from TS vasculature") +
+  ylab("Cell number")
+
+DimPlot(rpca_int_sct_v1, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'TS_vasc_predicted_id', split.by = "sample_disease_status") + NoLegend() + NoAxes()
+
+
+#saveRDS(rpca_int_sct_v1, "pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_anotd.rds")
+```
+
+## Markers per Cluster
+### using FindAllMarkers
+```{r}
+
+rpca_int_sct_v1 = read_rds("Integration_Objs/rpca_int_sct_clustered_TS_anotd.rds")
+
+rpca_int_sct_v1_ClstMarkrs = rpca_int_sct_v1
+
+# Find markers per cluster. 
+# IMPORTANT: need to set the proper min.pct and logfc.threshold parameters to identify all relevant markers
+DefaultAssay(rpca_int_sct_v1_ClstMarkrs) = "SCT"
+
+rpca_int_sct_v1_ClstMarkrs = PrepSCTFindMarkers(rpca_int_sct_v1_ClstMarkrs) #Takes time
+
+# Call DE genes for all clusters. Set min.pct=0.25 and logfc.threshold=0.25. Might have to be
+# a bit lenient with the thresholds since there are too many cells. 
+cluster_markers_v1 = FindAllMarkers(rpca_int_sct_v1_ClstMarkrs,
+                                 assay = "SCT",
+                                 logfc.threshold = 0.25,
+                                 min.pct = 0.25,
+                                 only.pos = TRUE)
+
+# saveRDS(cluster_markers_v1, file = "Cluster_Markers/rpca_int_sct_cluster_markers_v1.rds")
+#saveRDS(cluster_markers_v1, file = "pan_wirka_hu2/Cluster_Markers/rpca_int_sct_cluster_markers_v1.rds")
+
+# Clean markers df so we can rank genes based on Log2FC
+cluster_list = list()
+clusters_id = as.character(unique(cluster_markers_v1$cluster))
+clusters_n = length(unique(cluster_markers_v1$cluster))
+for (i in seq_len(clusters_n)) {
+  cluster = cluster_markers_v1 %>%
+    filter(cluster == clusters_id[i]) %>%
+    arrange(desc(avg_log2FC)) %>%
+    head(n=100) %>%
+    relocate(gene) 
+  cluster_list[[i]] = cluster
+}
+
+cluster_logfc_ordered_markers_df = data.table::rbindlist(cluster_list)
+head(cluster_logfc_ordered_markers_df, n=30)
+
+
+```
+
+### Ucell
+```{r}
+# From issue  https://github.com/carmonalab/UCell/issues/31
+#I would recommend calculating signature scores on the uncorrected assays (RNA or SCT). While batch effects can be large on the global transcriptome, you could expect them to have a small impact on the reduced gene sets used for signature scoring.
+
+dim(rpca_int_sct_v1@assays$RNA@data)
+# 22937 82306
+dim(rpca_int_sct_v1@assays$SCT@data)
+# 22928 82306
+dim(rpca_int_sct_v1@assays$integrated@data)
+# 3000 82306
+
+# This is taken from https://www.sciencedirect.com/science/article/pii/S221112472301392X?via%3Dihub#mmc3
+cell_markers_S2 = readxl::read_xlsx("pan_wirka_hu2/Cluster_Markers/1-s2.0-S221112472301392X-mmc3.xlsx", sheet = 2, skip = 4)
+
+level2_markers = list()
+level2_markers$SMC = cell_markers_S2 %>% dplyr::filter(cluster == "SMC") %>% pull(gene)
+level2_markers$Pericyte = cell_markers_S2 %>% dplyr::filter(cluster == "Pericyte") %>% pull(gene)
+level2_markers$Fibroblast = cell_markers_S2 %>% dplyr::filter(cluster == "Fibroblast") %>% pull(gene)
+
+level2_markers$Monocytes_DC = cell_markers_S2 %>% dplyr::filter(cluster == "Monocytes/DC") %>% pull(gene)
+level2_markers$B_cell = cell_markers_S2 %>% dplyr::filter(cluster == "B_cell") %>% pull(gene)
+level2_markers$Mast_cell = cell_markers_S2 %>% dplyr::filter(cluster == "Mast_cell") %>% pull(gene)
+level2_markers$Activated_NK = cell_markers_S2 %>% dplyr::filter(cluster == "Activated_NK") %>% pull(gene)
+level2_markers$NAMPT_Neutrophils = cell_markers_S2 %>% dplyr::filter(cluster == "NAMPT_Neutrophils") %>% pull(gene)
+
+level2_markers$Inflammatory_Mac = cell_markers_S2 %>% dplyr::filter(cluster == "Inflammatory_Mac") %>% pull(gene)
+level2_markers$Phagocytosis_Mac = cell_markers_S2 %>% dplyr::filter(cluster == "Phagocytosis_Mac") %>% pull(gene)
+level2_markers$Tissue_resident_Mac = cell_markers_S2 %>% dplyr::filter(cluster == "Tissue_resident_Mac") %>% pull(gene)
+level2_markers$Foamy_Mac1 = cell_markers_S2 %>% dplyr::filter(cluster == "Foamy_Mac1") %>% pull(gene)
+level2_markers$Foamy_Mac2 = cell_markers_S2 %>% dplyr::filter(cluster == "Foamy_Mac2") %>% pull(gene)
+
+level2_markers$Plasma_cell = cell_markers_S2 %>% dplyr::filter(cluster == "Plasma_cell") %>% pull(gene)
+level2_markers$pDC = cell_markers_S2 %>% dplyr::filter(cluster == "pDC") %>% pull(gene)
+level2_markers$cDC = cell_markers_S2 %>% dplyr::filter(cluster == "cDC") %>% pull(gene)
+
+level2_markers$Neuron = cell_markers_S2 %>% dplyr::filter(cluster == "Neuron") %>% pull(gene)
+
+#saveRDS(level2_markers, "pan_wirka_hu2/Cluster_Markers/level2_markers_list.rds")
+
+# Saving the level2_markers
+# Custom function to convert and assign column names
+convert_to_df <- function(element, name) {
+  df <- as.data.frame(element)
+  colnames(df) <- rep(name, ncol(df))
+  return(df)
+}
+
+df_list <- mapply(convert_to_df, level2_markers, names(level2_markers), SIMPLIFY = FALSE)
+
+writexl::write_xlsx(df_list, path = "Table_S4.xlsx")
+
+DefaultAssay(rpca_int_sct_v1) = "SCT"
+rpca_int_sct_v1 <- AddModuleScore_UCell(rpca_int_sct_v1, features = level2_markers)
+
+```
+
+
+### sc-type
+```{r}
+
+# Cell Annotation using sc-type
+# It seems it is more adopted for homo sapiens.
+# https://www.nature.com/articles/s41467-022-28803-w
+
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+
+rpca_int_sct_v1 = read_rds("Integration_Objs/rpca_int_sct_clustered_TS_anotd.rds")
+
+
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# DB file
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue = "Immune system" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+tissue = "Muscle"
+
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+sctype_test = rpca_int_sct_v1
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = sctype_test[["SCT"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(sctype_test@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(sctype_test@meta.data[sctype_test@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(sctype_test@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+## Run this if tissue = "Immune system"
+####tissue = "Immune system"######
+sctype_test@meta.data$sctype_immune = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  sctype_test@meta.data$sctype_immune[sctype_test@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+##################
+
+# Run this if tissue = "Muscle"
+####tissue = "Muscle"######
+sctype_test@meta.data$sctype_muscle = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  sctype_test@meta.data$sctype_muscle[sctype_test@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+##################
+
+
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_immune')        
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_immune', split.by = "sample_disease_status") + NoLegend() + NoAxes()
+
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_muscle')        
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_muscle', split.by = "sample_disease_status") + NoLegend() + NoAxes()
+
+DimPlot(subset(sctype_test, subset = arterial_origin == "coronary"), reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif', split.by = "sample_disease_status") + NoLegend() + NoAxes()
+
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif', split.by = "sample")
+
+p1 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')
+p2 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'manual_annotations') + NoLegend()
+plot_grid(p1, p2, nrow = 2)
+
+#Save
+rpca_int_sct_v2 = sctype_test
+#saveRDS(rpca_int_sct_v2, "pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_Ucel_Sctype_anotd.rds")
+
+### load auto-detection function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/auto_detect_tissue_type.R")
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+
+# guess a tissue type
+tissue_guess = auto_detect_tissue_type(path_to_db_file = db_, seuratObject = sctype_test, scaled = TRUE, assay = "SCT")  # if scaled = TRUE, make sure the data is scaled, as seuratObject[[assay]]@scale.data is used. If you just created a Seurat object, without any scaling and normalization, set scaled = FALSE, seuratObject[[assay]]@counts will be used
+####
+
+saveRDS(sctype_test, file = "ord_et_al_GSE205930/sorted_data/sctype_0.rds")
+
+```
+
+### Manual
+```{r}
+
+rpca_int_sct_v2 = read_rds("pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_Ucel_Sctype_anotd.rds")
+
+###Annotation steps
+DimPlot(rpca_int_sct_v2, label = T, repel = T, split.by = "sample_disease_status") + NoAxes() + NoLegend()
+DimPlot(rpca_int_sct_v2, label = T, repel = T, group.by = "TS_vasc_predicted_id" , split.by = "sample_disease_status") + NoAxes() + NoLegend()
+
+df = as.data.frame(rpca_int_sct_v2@meta.data)
+
+# Select columns ending with 'UCell'
+ucell_cols <- grep("UCell$", names(df), value = TRUE)
+
+# Group by 'seurat_clusters' and calculate mean for 'UCell' columns
+df_grouped <- df %>%
+  group_by(seurat_clusters) %>%
+  summarise(across(ucell_cols, mean, na.rm = TRUE))
+
+# Add a column 'max_value_column' that shows the column with maximum value for each 'seurat_clusters'
+df_grouped$max_value_column <- apply(df_grouped[, ucell_cols], 1, function(x) names(which.max(x)))
+
+View(df_grouped)
+
+# Print unique values in specified columns for each 'seurat_clusters'
+for(cluster in unique(df$seurat_clusters)){
+  cat(paste0(cluster, "_"))}
+
+# Specify the cluster you are interested in
+df_grouped %>% dplyr::filter(seurat_clusters == 25) %>% dplyr::select(seurat_clusters, max_value_column)
+
+cluster <- 25
+
+df_cluster <- df[df$seurat_clusters == cluster,]
+cat(paste0("\nFor seurat_clusters = ", cluster, ":\n"))
+cat("Unique values in 'TS_immune_predicted_id': ", unique(df_cluster$TS_immune_predicted_id), "\n")
+cat("Unique values in 'TS_vasc_predicted_id': ", unique(df_cluster$TS_vasc_predicted_id), "\n")
+df %>% dplyr::filter(seurat_clusters == cluster) %>% dplyr::select(TS_vasc_predicted_id, TS_immune_prediction_score_max) %>% group_by(TS_vasc_predicted_id) %>% summarise(n=n())
+cat("Unique values in 'sctype_immune': ", unique(df_cluster$sctype_immune), "\n")
+cat("Unique values in 'sctype_muscle': ", unique(df_cluster$sctype_muscle), "\n")
+########
+
+# Add cell type labels using {TS, FindAllMarkers, Ucell, and sc-type}
+pericytes = c(13, 15)
+smc = c(0, 3, 6, 7, 12, 29)
+fibroblasts = c(2,5, 8, 17, 19, 25)
+#fibroblast4 = c(25)
+neuron = c(28)
+
+# Endo
+endothelial = c(11, 14, 20, 27, 30)
+
+# Myeloid
+#foamy_mac1 = c()
+foamy_mac = c(10, 18) # It is foamy_mac2
+inflammatory_mac = c(1)
+monocytes = c(26)
+#nampt_neutrophils = c()
+cDCs = c(16) # conventional dendritic cells (cDCs)
+tissue_resident_macs = c(21) # Known markers of tissue resident macrophages include F13A, FOLR2, LYVE1, DAB2, STAB1, MRC1, MS4A6A 
+# pDC = c()
+NK_T = c(4,9)
+b_cell = c(22)
+mast_cell = c(23)
+plasma_cell = c(24)
+
+# Add annotations
+metadata_df = rpca_int_sct_v2@meta.data
+dim(metadata_df)
+
+# Check if all values in the first and second column are identical
+all(metadata_df[,c("seurat_clusters")] == metadata_df[,c("integrated_snn_res.1")])
+
+new_meta_df = metadata_df %>%
+  mutate(annotations = case_when(integrated_snn_res.1 %in% pericytes ~ "Pericyte",
+                                        integrated_snn_res.1 %in% smc ~ "SMC",
+                                        integrated_snn_res.1 %in% fibroblasts ~ "Fibroblast",
+                                        integrated_snn_res.1 %in% neuron ~ "Neuron",
+                                        integrated_snn_res.1 %in% endothelial ~ "Endothelial",
+                                        integrated_snn_res.1 %in% foamy_mac ~ "Foamy_Mac",
+                                        integrated_snn_res.1 %in% inflammatory_mac ~ "Inflammatory_Mac",
+                                        integrated_snn_res.1 %in% monocytes ~ "Monocytes",
+                                        integrated_snn_res.1 %in% cDCs ~ "cDC",
+                                        integrated_snn_res.1 %in% tissue_resident_macs ~ "Tissue_resident_Mac",
+                                        integrated_snn_res.1 %in% NK_T ~ "T/NK",
+                                        integrated_snn_res.1 %in% b_cell ~ "B_cell",
+                                        integrated_snn_res.1 %in% plasma_cell ~ "Plasma_cell",
+                                        integrated_snn_res.1 %in% mast_cell ~ "Mast_cell"))
+
+rownames(new_meta_df) = rownames(rpca_int_sct_v2@meta.data)
+rpca_int_sct_v2@meta.data = new_meta_df
+
+Idents(rpca_int_sct_v2) = "annotations"
+
+#Save
+rpca_int_sct_v3 = rpca_int_sct_v2
+DimPlot(rpca_int_sct_v3, label = T, repel = T , split.by = "sample_disease_status") + NoAxes() + NoLegend()
+
+saveRDS(rpca_int_sct_v3, "pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_Ucel_Sctype_anotd_Final.rds")
+
+```
+
+# Metadata Stats
+```{r}
+rpca_int_sct_v3 = read_rds("pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_Ucel_Sctype_anotd_Final.rds")
+
+DimPlot(rpca_int_sct_v3, label = T, repel = T) + custom_theme  + NoLegend()
+
+#Main Figures
+## Integrated datasets
+DimPlot(rpca_int_sct_v3, label = T, repel = T, label.box = T)  + NoAxes() + NoLegend() + ggtitle(label = paste("Integration of three single-cell studies ","(n = ", dim(rpca_int_sct_v3@meta.data)[1], ")", sep = "")) + theme(title = element_text(size = 12))
+
+ggsave(filename = "pan_wirka_hu2/Figures/homo_single_umap.png", width = 5.8, height = 4.3 )
+
+## Condition
+# Re factor covariates
+rpca_int_sct_v3$sample_disease_status = factor(rpca_int_sct_v3$sample_disease_status,
+                                                  levels = c("non_lesion", "lesion"))
+
+DimPlot(rpca_int_sct_v3, label = F, repel = F, split.by = "sample_disease_status") + NoLegend() +
+  NoAxes() + theme(strip.text = element_text(size = 13, face = "bold"), plot.subtitle = element_blank(), plot.title = element_text(size=12, face = "bold", hjust = 0.05, margin=margin(0,0,-40,0))) 
+   
+ggsave(filename = "pan_wirka_hu2/Figures/homo_condition_umap.png", width = 5.8, height = 4.3 )
+
+### Mq & Condition
+DefaultAssay(rpca_int_sct_v3) = "SCT"
+MQ_clusters = c("Foamy_Mac","Inflammatory_Mac", "Tissue_resident_Mac", "Monocytes", "cDC")
+mq_subset = subset(rpca_int_sct_v3, idents = MQ_clusters)
+
+#https://r-charts.com/ggplot2/facets/
+DimPlot(mq_subset, label = F, repel = F, split.by = "sample_disease_status") +
+    custom_theme +
+  NoAxes() + theme(strip.text = element_text(size = 12, face = "bold"), plot.subtitle = element_blank(), plot.title = element_text(size=12, face = "bold", hjust = 0.05, margin=margin(0,0,-40,0)), legend.text = element_text(size = 11)) +
+  labs(title = "Macrophage subpopulation changes in different conditions ") 
+
+ggsave(filename = "pan_wirka_hu2/Figures/homo_MQ_condition_umap.png", width = 5.8, height = 4.3 )
+
+######
+
+#https://r-charts.com/ggplot2/facets/
+DimPlot(rpca_int_sct_v3, label = F, repel = F, split.by = "sample_disease_status") + custom_theme +
+  theme(strip.text = element_text(size = 14, face = "bold"))
+
+metadata = rpca_int_sct_v3@meta.data
+dim(metadata)
+
+# Plot percentage of cells type annotations by study
+table(metadata$study)
+
+annot_study = metadata %>% 
+  ggplot(aes(x=study, fill=annotations)) + 
+  geom_bar(position = "fill", width = 0.8) +
+  custom_theme + 
+  ylab("Cell proportion") +
+  xlab("Study") + 
+  #npg_scale2_bars + 
+  aaas_scale_bars +
+  theme(aspect.ratio = 1.7)
+
+# Get legend
+annot_legend = get_legend(annot_study + labs(fill="Cell Type") + 
+                             theme(legend.box.margin = margin(0, 0, 0, 12))) 
+                             
+
+# Plot arterial_origin
+table(metadata$arterial_origin)
+
+annot_arteries = metadata %>%
+  ggplot(aes(x=arterial_origin, fill=annotations)) + 
+  geom_bar(position = "fill", width = 0.4) + 
+  custom_theme + 
+  xlab("Arterial Bed") +
+  ylab("Cell proportion") + 
+  #npg_scale2_bars +
+  aaas_scale_bars +
+  theme(aspect.ratio = 1.7)
+
+# Plot sample_disease_status
+table(metadata$sample_disease_status)
+
+annot_disease = metadata %>%
+  ggplot(aes(x=sample_disease_status, fill=annotations)) + 
+  geom_bar(position = "fill", width = 0.4) + 
+  custom_theme + 
+  xlab("Condition") +
+  ylab("Cell proportion") + 
+  #npg_scale2_bars +
+  aaas_scale_bars +
+  theme(aspect.ratio = 1.7)
+
+# Plot metadata figures
+prow = cowplot::plot_grid(annot_study + theme(legend.position = "none", 
+                                               axis.text.x = element_text(angle = 45, hjust=1)), 
+                          annot_arteries + theme(legend.position = "none", 
+                                                  axis.text.x = element_text(angle = 45, hjust=1)),
+                          annot_disease + theme(legend.position = "none", 
+                                                 axis.text.x = element_text(angle = 45, hjust=1)),
+                          align = "vh", hjust = -1, nrow = 1)
+
+annot_metadata = cowplot::plot_grid(prow, annot_legend, rel_widths = c(3, .6), label_y = "Cell proportion")
+ggsave(file = "pan_wirka_hu2/Figures/annot_metadata.pdf",
+       plot = annot_metadata, width = 14, height = 7)
+
+
+# Plot sample
+table(metadata$sample)
+
+metadata %>%
+  ggplot(aes(x=sample, fill=annotations)) + 
+  geom_bar(position = "fill") + 
+  custom_theme + 
+  ylab("Cell proportion") + 
+  npg_scale2_bars + 
+  theme(axis.text.x = element_text(angle=45,hjust = 1))
+
+# Plot MQ freq by disease status
+metadata %>%
+  filter(annotations %in% c("Foamy_Mac","Inflammatory_Mac", "Tissue_resident_Mac", "Monocytes", "cDC")) %>%
+  ggplot(aes(x=sample_disease_status, fill=annotations)) + 
+  geom_bar(position = "fill", width = 0.4) + 
+  custom_theme + 
+  ylab("Cell proportion") + 
+  level2_annotations_scale_bars + 
+  theme(legend.position = "bottom")
+
+# Normalize cell type freqs to percentage 
+table(metadata$sample_disease_status)
+
+cell_types = c("Foamy_Mac","Inflammatory_Mac", "Tissue_resident_Mac", "Monocytes", "cDC")
+cell_type_freqs = metadata %>%
+  filter(annotations %in% cell_types) %>%
+  group_by(annotations, sample_disease_status) %>%
+  summarize(n=length(annotations)) %>%
+  mutate(percentage = case_when(sample_disease_status == "lesion" ~ n/20023 * 100,
+                                TRUE ~ n/20666 * 100))
+
+# Plot cell type percentages 
+cell_type_freqs %>%
+  ggplot(aes(x=annotations, y=percentage, fill=sample_disease_status)) + 
+  geom_col(position = position_dodge(), width = 0.5) + 
+  geom_text(aes(label=round(percentage, digits = 2)), position = position_dodge(0.6), hjust=-0.1) + 
+  custom_theme + 
+  xlab("") + 
+  ylab("Cell percentage per disease status") +
+  theme(aspect.ratio = 0.5,
+        legend.position = c(0.9, 0.1), 
+        axis.text = element_text(size=14)) + 
+  coord_flip() +
+  scale_fill_lancet()
+
+# Subset reference to immune compartments for lesion vs non-lesion comparison
+#immune_clusters = c("T_NK", "Macrophage", "Plasma_cell", "B_cell", "pDC", "Mast_cell")
+MQ_clusters = c("Foamy_Mac","Inflammatory_Mac", "Tissue_resident_Mac", "Monocytes", "cDC")
+
+rpca_int_sct_v3_MQ = subset(rpca_int_sct_v3, subset = annotations %in% MQ_clusters)
+
+DimPlot(rpca_int_sct_v3_MQ, group.by = "annotations", split.by = "sample_disease_status", raster = FALSE, label = T) + custom_theme + 
+  level2_annotations_scale + theme(legend.position = "none")
+
+# MQ population
+rpca_int_sct_v3@meta.data %>% dplyr::filter(TS_immune_predicted_id == "macrophage") %>% group_by(sample_disease_status) %>% summarise(n=n())
+
+rpca_int_sct_v3@meta.data %>% dplyr::filter(annotations %in% MQ_clusters) %>% group_by(sample_disease_status) %>% summarise(n=n())
+
+```
+

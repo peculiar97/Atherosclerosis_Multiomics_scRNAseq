@@ -1,0 +1,774 @@
+---
+title: "SingleCell_Mouse_Atherosclerosis"
+output: html_document
+date: "2024-02-26"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Libraries
+```{r}
+
+library(here)
+library(rafalib)
+library(stringr)
+library(dplyr)
+library(ggplot2, lib.loc = "/usr/lib/R/site-library") #This is latest version
+library(ggrepel)
+library(ggridges)
+library(Seurat)
+library(purrr)
+library(data.table)
+library(readr)
+library(harmony)
+library(scCustomize)
+library(SeuratDisk)
+library(AnnotationHub)
+library(RCurl)
+library(cowplot)
+library(clustree)
+library(rafalib)
+library(enrichR)
+library(enrichplot)
+library(DOSE)
+library(clusterProfiler)
+library(patchwork)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(kableExtra)
+library(msigdbr)
+library(fgsea)
+library(monocle3) #Installed this devtools::install_github('cole-trapnell-lab/monocle3', ref="develop")
+#library(GGally)
+library(gprofiler2)
+library(glmGamPoi)
+library(cluster)
+library(zinbwave)
+library(dorothea)
+library(decoupleR) #https://github.com/saezlab/decoupleR/issues/118 tutorial in python
+library(viper)
+library(singleCellTK)
+library(Libra) # https://github.com/neurorestore/Libra & https://github.com/neurorestore/Libra/issues/30
+
+# https://github.com/YosefLab/VISION/?tab=readme-ov-file
+# https://bioconductor.org/packages/devel/bioc/vignettes/GOSemSim/inst/doc/GOSemSim.html
+# https://github.com/MarioniLab/miloR?tab=readme-ov-file
+
+source("scRNA_processing_utils.R") # with my modifications from https://github.com/MillerLab-CPHG/Human_athero_scRNA_meta/blob/main/utils/scRNA_processing_utils.R
+```
+
+
+```{r}
+#we know that the output can generate large R objects/variables in terms of memory. 
+#If we have a large dataset, then we might need to adjust the limit for allowable object sizes within R (Default is 500 * 1024 ^ 2 = 500 Mb) using the following code:
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# Set seed for reproducibility
+set.seed(1)
+
+```
+
+# Prepare datasets
+```{r}
+
+
+prefix_string="GSM6235810,GSM6235811,GSM6235812,GSM6235814" #NO LPS
+(GSMs = as.character(unlist(strsplit(prefix_string,","))))
+
+# Create each individual Seurat object for every sample
+# https://github.com/satijalab/seurat/issues/432
+for (file in GSMs){
+        seurat_data <- Read10X(data.dir = paste0("data_sorted/", file))
+        seurat_obj <- CreateSeuratObject(counts = seurat_data$`Gene Expression`, 
+                                         min.features = 0, #200  To prevent cell loss, both were set to 0
+                                         min.cells = 0, #10
+                                         project = file)
+        assign(file, seurat_obj)
+}
+
+# Create a list
+
+obj_list = list(GSM6235810, GSM6235811, GSM6235812, GSM6235814) # NO LPS
+
+# Merging Seurat object 
+merged_seurat = Merge_Seurat_List(list_seurat = list(GSM6235810, GSM6235811, GSM6235812, GSM6235814),
+                                  add.cell.ids = c("C", "PL", "ED","LD")) # NO LPS
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+```
+
+# Metadata
+```{r}
+# Calculating proportion of reads mapping to mitochondrial transcripts
+# https://github.com/hbctraining/scRNA-seq/blob/master/lessons/mitoRatio.md
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Check versions of databases available
+ahDb %>% 
+  mcols()
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")       
+
+# Select annotations of interest
+annotations <- annotations %>%
+  dplyr::select(gene_id, gene_name, gene_biotype, seq_name, description, entrezid)
+                         
+View(annotations)    
+
+# Extract IDs for mitochondrial genes
+mt <- annotations %>%
+        dplyr::filter(seq_name == "MT") %>%
+        dplyr::pull(gene_name)
+
+# The pattern provided ("^mt-") works for mouse gene names 
+
+# Genes for regressing out cell cycle variance
+cc.genes.updated.2019
+mmus_s = gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+mmus_g2m = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+
+## Define hemoglobin genes
+hb_index = grep(rownames(merged_seurat), pattern = "^Hb[ab]")
+# Make sure they are Hb genes
+mmus_hb = gconvert(rownames(merged_seurat)[hb_index], organism = "mmusculus", target = "ENTREZGENE")$target
+
+```
+
+
+```{r}
+
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# Compute percent mito ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^mt-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+merged_seurat$hbRatio = PercentageFeatureSet(merged_seurat, pattern = "^Hb[ab]")
+merged_seurat$hbRatio = merged_seurat@meta.data$hbRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^C_"))] <- "Ct"
+metadata$sample[which(str_detect(metadata$cells, "^PL_"))] <- "Mt"
+metadata$sample[which(str_detect(metadata$cells, "^ED_"))] <- "Mt_1m_HFD"
+metadata$sample[which(str_detect(metadata$cells, "^LD_"))] <- "Mt_3m_HFD"
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+                           
+saveRDS(merged_seurat, file = "ord_et_al_GSE205930/sorted_data/merged_Unfiltered_seurat_0.rds")
+```
+
+# Quality Check of Raw Data
+
+```{r echo=FALSE, cache=TRUE}
+# Read unfiltered object
+merged_seurat = readRDS(file = "ord_et_al_GSE205930/sorted_data/merged_Unfiltered_seurat_0.rds")
+
+metadata  =  merged_seurat@meta.data
+
+#Assessing the quality metrics
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar(show.legend = F) +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) + labs(x="") +
+  	ggtitle("Number of Cells in each Group")
+
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") + theme(plot.title = element_text(hjust=0.5, face="bold")) +
+    ggtitle("Number of UMIs/transcripts per Cell") + labs(x = "log10(Number of UMI))")
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() + theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	scale_x_log10() + labs(x = "log10(Number of Genes)") + ggtitle("The Distribution of Genes detected per Cell")
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot(show.legend = F) + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("Number of Genes") + labs(x="")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + theme(plot.title = element_text(hjust=0.5, face="bold", size = 10)) +
+  	theme_classic() + labs(x="log10(nUMI)", y="log10(nGene)") +
+  	facet_wrap(~sample) + ggtitle("The Correlation between Genes detected and Number of UMIs") 
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() + theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	geom_vline(xintercept = 0.2) + ggtitle("Mitochondrial Gene Expression Ratio")
+
+```
+
+# Filtering out Low-Quality Cells
+
+- **Filtering is performed based on QC metrics such as number of genes, UMI and mitoRatio.**
+- The criteria for filtering includes: 
+
+```{r}
+##Filtering
+
+merged_seurat = readRDS(file = "ord_et_al_GSE205930/sorted_data/merged_Unfiltered_seurat_0.rds")
+
+#Removing ambient RNA (Takes time ~ 5 min)
+merged_seurat = decontX_remove(merged_seurat)
+
+####Cell-level filtering
+# Filter out low quality cells using selected thresholds - these will change with experiment
+filtered_seurat <- subset(x = merged_seurat, 
+                         subset= (nUMI >= 200 & nUMI <= 20000 ) & 
+                           (nGene >= 200 & nGene <= 4000) & 
+                           (mitoRatio <= 0.10) & (hbRatio <= 0.05))
+
+
+# Calculate cell cycle scores
+  filtered_seurat = CellCycleScoring(filtered_seurat, s.features = mmus_s, 
+                                g2m.features = mmus_g2m)			                          
+
+####Gene-level filtering
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+
+saveRDS(filtered_seurat, file = "ord_et_al_GSE205930/sorted_data/merged_filtered_seurat_0.rds" )
+
+```
+
+## Filtering vs Un-filtering
+```{r}
+###Comparison
+
+#Xist is not normally expressed in male cells
+
+#Before
+merged_seurat = readRDS(file = "ord_et_al_GSE205930/sorted_data/merged_Unfiltered_seurat_0.rds")
+
+######From Seurat(https://satijalab.org/seurat/articles/pbmc3k_tutorial)
+# Visualize QC metrics as a violin plot
+print("Before Filtering")
+VlnPlot(merged_seurat, features = c("nUMI", "nGene", "mitoRatio", "hbRatio"), ncol  = 2, group.by = "sample", combine = T)
+
+#After
+filtered_seurat = readRDS(file = "ord_et_al_GSE205930/sorted_data/merged_filtered_seurat_0.rds")
+
+print("After Filtering")
+VlnPlot(filtered_seurat, features = c("nUMI", "nGene", "mitoRatio", "hbRatio"), ncol = 2, group.by = "sample")
+
+```
+
+# Normalization
+```{r}
+## Normalization, variance stabilization, and regression of unwanted variation for each sample
+
+filtered_seurat = readRDS(file = "ord_et_al_GSE205930/sorted_data/merged_filtered_seurat_0.rds")
+
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+
+##Takes around 5min!
+split_seurat <- lapply(X = split_seurat, FUN = function(x) {
+    
+    x <- SCTransform(x, vars.to.regress = c("S.Score","G2M.Score"), vst.flavor="v2") %>%
+      RunPCA() %>%
+      FindNeighbors(reduction = "pca", dims = 1:30, k.param = 20) %>%
+      RunUMAP(dims = 1:30, n.neighbors = 30)
+})
+
+saveRDS(split_seurat, file = "ord_et_al_GSE205930/sorted_data/split_seurat_SCT_0.rds")
+```
+
+
+# Integration
+```{r}
+
+######## Run with Integration (let's perform the integration across Samples)
+# Select the most variable features to use for integration
+
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000) 
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+
+split_seurat = lapply(split_seurat, FUN = function(x) {
+  x = RunPCA(x, features=integ_features)
+}) 
+
+# Find best buddies - "rpca" is very fast
+# https://satijalab.org/seurat/articles/integration_rpca.html
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features,
+                                        reduction = "cca",  # as suggested by https://doi.org/10.1016/j.ajhg.2023.03.013
+                                        dims = 1:30) 
+
+# Integrate across conditions
+# If cell types are present in one dataset, but not the other, then the cells will still appear as a separate sample-specific cluster.
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT", dims = 1:30)
+
+# Save integrated seurat object
+saveRDS(seurat_integrated, "ord_et_al_GSE205930/sorted_data/integrated_seurat_cca.rds")
+
+```
+
+## Clustering
+```{r}
+# Run PCA and UMAP on integrated object (default is now integrated object)
+DefaultAssay(seurat_integrated) = "integrated"
+
+# Run standard workflow for dimensionality reduction and clustering
+# 30 dims captures really most of the variation in the data
+seurat_integrated = RunPCA(seurat_integrated) 
+seurat_integrated = FindNeighbors(seurat_integrated, reduction = "pca", dims = 1:30, k.param = 20)
+seurat_integrated = RunUMAP(seurat_integrated, dims = 1:30) 
+
+### Finding Best Resolution for integrated object
+
+resolutions_sil_df = calc_sil_scores_for_res(seurat_integrated, clustering_res = c(0.6, 0.7, 0.75 ,0.8, 1.0,1.1,  1.4, 1.6))
+
+max_avg_sil_score(resolutions_sil_df) #res_0.7 has highest sil score
+
+seurat_integrated = FindClusters(seurat_integrated, resolution = c(0.7))
+
+DimPlot(seurat_integrated, group.by = "seurat_clusters", label = T, reduction = "umap") + NoLegend()
+
+```
+
+## Annotation
+
+```{r}
+######################################
+## Extract markers per cluster
+seurat_integrated_markers = seurat_integrated
+
+DefaultAssay(seurat_integrated_markers) = "SCT"
+
+seurat_integrated_markers = PrepSCTFindMarkers(seurat_integrated_markers)
+cluster_markers = FindAllMarkers(seurat_integrated_markers,
+                                 assay = "SCT",
+                                 logfc.threshold = 0.25,
+                                 min.pct = 0.1,
+                                 only.pos = TRUE)
+
+#top20 = cluster_markers %>% group_by(cluster) %>% top_n(20, wt = avg_log2FC)
+###########################################
+# The file is taken from https://ars.els-cdn.com/content/image/1-s2.0-S0002929723000976-mmc2.xlsx
+# Table S1. Markers of the major cell types identified by supervised clustering.
+cell_markers_S1 = readxl::read_xlsx("ord_et_al_GSE205930/1-s2.0-S0002929723000976-mmc2.xlsx", sheet = 1, skip = 2)
+
+
+seurat_integrated_markers = AddModuleScore(seurat_integrated_markers, features = list(cell_markers_S1$SMC,
+                            cell_markers_S1$Dediff_SMC, cell_markers_S1$Chondro_like, cell_markers_S1$EC,
+                            cell_markers_S1$Pericyte, cell_markers_S1$FB, cell_markers_S1$MSC,
+                            cell_markers_S1$MP, cell_markers_S1$NK_T, cell_markers_S1$Other_non_imm,
+                            cell_markers_S1$Epithelial_like), name = colnames(cell_markers_S1))
+
+# Visualize gene expression using SCTransform-normalized counts
+DefaultAssay(seurat_integrated) = "SCT"
+
+
+# macrophage (Csf1r, Cd68, Adgre1) 
+macrophage = c(9,13, 7, 16)
+FeaturePlot(seurat_integrated ,features = c("Csf1r", "Cd68", "Adgre1"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Csf1r", "Cd68", "Adgre1"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Csf1r", "Cd68", "Adgre1"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(MP8)) %>%  arrange(desc(`mean(MP8)`)) %>% head(5)
+
+
+# smooth muscle (Myh11, Tagln, Cnn1) 
+smooth_muscle = c(0, 1, 2, 3, 15, 18, 17, 5)
+FeaturePlot(seurat_integrated ,features = c("Myh11", "Tagln", "Cnn1"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Myh11", "Tagln", "Cnn1"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Myh11", "Tagln", "Cnn1"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(SMC1)) %>%  arrange(desc(`mean(SMC1)`)) %>% head(10)
+
+# endothelial (Pecam1, Cdh5, Cldn5) 
+endothelial = c(10)
+FeaturePlot(seurat_integrated ,features = c("Pecam1", "Cdh5", "Cldn5"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Pecam1", "Cdh5", "Cldn5"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Pecam1", "Cdh5", "Cldn5"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(EC4)) %>%  arrange(desc(`mean(EC4)`)) %>% head(5)
+
+
+# pericyte (Rgs5) 
+pericyte = c(12)
+FeaturePlot(seurat_integrated ,features = c("Rgs5"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Rgs5"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Rgs5"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(Pericyte5))
+
+# dedifferentiated SMC (Vcam1, Lgals3, Dcn)
+dedifferentiated_SMC = c( 11)
+FeaturePlot(seurat_integrated ,features = c("Vcam1", "Lgals3", "Dcn"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme + theme_void()
+
+VlnPlot(seurat_integrated ,features = c("Vcam1", "Lgals3", "Dcn"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Vcam1", "Lgals3", "Dcn"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(Dediff_SMC2)) %>%  arrange(desc(`mean(Dediff_SMC2)`)) %>% head(5)
+
+# chondrocyte-like (Comp, Fmod)
+chondrocyte_like = c(8)
+FeaturePlot(seurat_integrated ,features = c("Comp", "Fmod"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme + theme_void()
+
+VlnPlot(seurat_integrated ,features = c("Comp", "Fmod"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Comp", "Fmod"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(Chondro_like3)) %>%  arrange(desc(`mean(Chondro_like3)`)) %>% head(5)
+
+
+# fibroblast (Fbln1, Pdgfra, Serpinf1) 
+fibroblast = c(4,6 )
+FeaturePlot(seurat_integrated ,features = c("Fbln1", "Pdgfra", "Serpinf1"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Fbln1", "Pdgfra", "Serpinf1"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Fbln1", "Pdgfra", "Serpinf1"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(FB6)) %>%  arrange(desc(`mean(FB6)`)) %>% head(5)
+
+
+# mesenchymal stromal (Ly6a, Pi16) 
+mesenchymal_stromal = c()
+FeaturePlot(seurat_integrated ,features = c("Ly6a", "Pi16"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Ly6a", "Pi16"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Ly6a", "Pi16"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(MSC7)) %>%  arrange(desc(`mean(MSC7)`)) %>% head(10)
+
+
+# epithelial-like (Upk3b) 
+endothelial_like = c()
+FeaturePlot(seurat_integrated ,features = c("Upk3b"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Upk3b"), group.by = "seurat_clusters", slot = "data", sort = T, flip = T)
+cluster_markers[cluster_markers$gene %in% c("Upk3b"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(Epithelial_like11)) %>%  arrange(desc(`mean(Epithelial_like11)`)) %>% head(5)
+
+
+# NK/T (Cd3d, Cd8b1, Nkg7)
+NK_T = c(14)
+FeaturePlot(seurat_integrated ,features = c("Cd3d", "Cd8b1", "Nkg7"), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 8, label.color = "red") & new_scale3 & custom_theme
+
+VlnPlot(seurat_integrated ,features = c("Cd3d", "Cd8b1", "Nkg7"), group.by = "seurat_clusters", slot = "data", sort = T)
+cluster_markers[cluster_markers$gene %in% c("Cd3d", "Cd8b1", "Nkg7"), ]
+seurat_integrated_markers@meta.data %>% dplyr::group_by(seurat_clusters) %>% summarise(mean(NK_T9)) %>%  arrange(desc(`mean(NK_T9)`)) %>% head(5)
+
+
+# Check a specific cluster
+seurat_integrated_markers@meta.data %>% dplyr::filter(seurat_clusters == 19) %>% summarise(mean(SMC1), mean(Dediff_SMC2), mean(Pericyte5), mean(Chondro_like3), mean(MSC7), mean(FB6), mean(EC4))
+
+# Add cell type labels
+macrophage = c(9,13, 7, 16)
+smooth_muscle = c(0, 1, 2, 3, 15, 18, 17, 5)
+endothelial = c(10)
+epithelial_like = c() # No
+pericyte = c(12)
+chondrocyte_like = c(8)
+dedifferentiated_SMC = c(11)
+fibroblast = c(4,6)
+mesenchymal_stromal = c(19)
+NK_T = c(14)
+
+metadata_df = seurat_integrated@meta.data
+new_meta_df = metadata_df %>%
+  mutate(manual_annotations = case_when(integrated_snn_res.0.7 %in% macrophage ~ "Macrophage",
+                                        integrated_snn_res.0.7 %in% smooth_muscle ~ "Smooth_Muscle",
+                                        integrated_snn_res.0.7 %in% endothelial ~ "Endothelial",
+                                        integrated_snn_res.0.7 %in% epithelial_like ~ "Epithelial_Like",
+                                        integrated_snn_res.0.7 %in% pericyte ~ "Pericyte",
+                                        integrated_snn_res.0.7 %in% chondrocyte_like ~ "Chondrocyte_Like", 
+                                        integrated_snn_res.0.7 %in% dedifferentiated_SMC ~ "Dedifferentiated_SMC",
+                                        integrated_snn_res.0.7 %in% fibroblast ~ "Fibroblsat",
+                                        integrated_snn_res.0.7 %in% mesenchymal_stromal ~ "Mesenchymal_Stromal",
+                                        integrated_snn_res.0.7 %in% NK_T ~ "NK_T"))
+
+rownames(new_meta_df) = rownames(seurat_integrated@meta.data)
+seurat_integrated@meta.data = new_meta_df
+
+DimPlot(seurat_integrated, label = T, group.by = "manual_annotations", repel = T) & theme_void()
+DimPlot(seurat_integrated, label = T, group.by = "manual_annotations", repel = T, split.by = "sample") & theme_void()
+
+seurat_integ_annotd = seurat_integrated
+
+seurat_integ_annotd@meta.data = seurat_integ_annotd@meta.data %>%
+  mutate(disease_status = case_when(sample == "Ct" ~ "Control",
+                                    sample == "Mt" ~ "Pre_lesion",
+                                    sample == "Mt_1m_HFD" ~ "Early_disease",
+                                    sample == "Mt_3m_HFD" ~ "Late_disease"))
+
+seurat_integ_annotd$disease_status = factor(seurat_integ_annotd$disease_status,
+                              levels = c("Control", "Pre_lesion", "Early_disease", "Late_disease"))
+
+# Remove Unknown cells
+#cls_to_removed = WhichCells(seurat_integrated, idents = c(# cluster No))
+#DimPlot(seurat_integrated, label = T, group.by = "manual_annotations", cells.highlight = cls_to_removed, 
+#seurat_integ_annotd = subset(seurat_integrated, cells = cls_to_removed, invert = T)
+
+Idents(seurat_integ_annotd) = "manual_annotations"
+
+c1 = DimPlot(seurat_integ_annotd, label = T, group.by = "manual_annotations", repel = T) & NoLegend() & NoAxes()
+
+c2 = DimPlot(seurat_integ_annotd, label = T, group.by = "manual_annotations", repel = T, split.by = "disease_status") & NoLegend() & NoAxes()
+
+
+saveRDS(seurat_integ_annotd, file = "ord_et_al_GSE205930/sorted_data/seurat_integ_annotd_0.rds")
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNo_correction/seurat_integ_annotd_with_disease.pdf", 
+       plot = c2 ,width = 8.5, height = 9)
+```
+
+### ExtraMarkers
+
+```{r}
+####https://github.com/MillerLab-CPHG/Human_athero_scRNA_meta/blob/main/ref_integration/datasets_integration.R
+# Inflammatory
+FeaturePlot(seurat_integrated ,features = str_to_title(c("IL1B", "CCL3", "CCL2", "TNF", "NFKBIA", "S100A9")), raster=FALSE,
+            order = TRUE,  pt.size = 0.1, slot = "data") & new_scale & custom_theme
+
+# Plasma cells
+FeaturePlot(seurat_integrated ,features = str_to_title(c("CD79B", "IGLC3", "JCHAIN", "MZB1")), 
+            order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE) & custom_theme & new_scale
+
+# SMC clusters from 
+FeaturePlot(seurat_integrated ,features = str_to_title(c("CNN1", "MYH11", "LMOD1", "COL6A1", "COL6A2", "COL6A3")), order = TRUE,  pt.size = 0.1, slot = "data", raster = FALSE, label = T, label.size = 5, label.color = "red") & new_scale3 & custom_theme
+
+# Fibromyocyte markers
+FeaturePlot(seurat_integrated ,features = str_to_title(c("CNN1", "TNFRSF11B", "VCAN", "KRT7")), raster = FALSE,
+            order = TRUE,  pt.size = 0.1, slot = "data", label = T, label.size = 5, label.color = "red") & new_scale
+
+# # Fibroblasts - Inflammatory endo
+FeaturePlot(seurat_integrated, features =str_to_title(c("APOD", "CFD", "DCN", "GSN", "SERPINF1", "CXCL14")), raster = FALSE,
+            order = TRUE, pt.size = 0.1, slot="data", label = T, label.size = 5, label.color = "red") & new_scale & custom_theme
+# Myofibroblasts
+FeaturePlot(seurat_integrated, features = str_to_title(c("IGFBP5", "C3", "C7", "ACTA2", "PODN", "PDGFRA")), raster = FALSE,
+            order = TRUE, pt.size = 0.1, slot="data") & new_scale3 & custom_theme
+
+# Neuron
+FeaturePlot(seurat_integrated, features = str_to_title(c("S100B", "MPZ", "PLP1", "GPM6B")),
+            order = TRUE, pt.size = 0.1, slot="data", raster = FALSE) & new_scale
+########
+
+```
+
+### sc-type
+```{r}
+
+# Cell Annotation using sc-type
+# It seems it is more adopted for homo sapiens.
+# https://www.nature.com/articles/s41467-022-28803-w
+
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+
+seurat_integ_annotd = readRDS(file = "ord_et_al_GSE205930/sorted_data/seurat_integ_annotd_0.rds")
+
+
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# DB file
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue = "Immune system" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+#tissue = "Muscle"
+
+##########################Mouse (a solution from a user)
+# From https://github.com/IanevskiAleksandr/sc-type/issues/4
+db_ = "https://github.com/IanevskiAleksandr/sc-type/files/12363488/sc_type_mouse_alltumours.xlsx"
+tissue = "All"
+##########################
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+sctype_test = seurat_integ_annotd
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = sctype_test[["SCT"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(sctype_test@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(sctype_test@meta.data[sctype_test@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(sctype_test@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+## Run this if tissue = "Immune system"
+####tissue = "Immune system"######
+sctype_test@meta.data$sctype_immune = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  sctype_test@meta.data$sctype_immune[sctype_test@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+##################
+
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_immune')        
+DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_immune', split.by = "sample") + NoLegend() + NoAxes()
+
+p1 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')
+p2 = DimPlot(sctype_test, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'manual_annotations') + NoLegend()
+plot_grid(p1, p2, nrow = 2)
+
+
+# load auto-detection function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/auto_detect_tissue_type.R")
+db_ = "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+
+# guess a tissue type
+tissue_guess = auto_detect_tissue_type(path_to_db_file = db_, seuratObject = sctype_test, scaled = TRUE, assay = "SCT")  # if saled = TRUE, make sure the data is scaled, as seuratObject[[assay]]@scale.data is used. If you just created a Seurat object, without any scaling and normalization, set scaled = FALSE, seuratObject[[assay]]@counts will be used
+
+saveRDS(sctype_test, file = "ord_et_al_GSE205930/sorted_data/sctype_0.rds")
+
+sctype_test = readRDS(file = "ord_et_al_GSE205930/sorted_data/sctype_0.rds")
+
+```
+
+## Metadata Stats
+```{r}
+
+# seurat_integ_annotd = readRDS(file = "ord_et_al_GSE205930/sorted_data/seurat_integ_annotd_0.rds")
+
+# This one also has sctype annotations
+mus_int_sctype = readRDS(file = "ord_et_al_GSE205930/sorted_data/sctype_0.rds")
+
+#Select specific groups
+mus_int_sctype_LD = subset(mus_int_sctype, subset = disease_status %in% c("Control", "Late_disease"))
+
+DimPlot(mus_int_sctype_LD, label = T, repel = T) + custom_theme  + NoLegend()
+
+#Main Figures
+## Integrated datasets
+DimPlot(mus_int_sctype_LD, label = T, repel = T, label.box = T)  + NoAxes() + NoLegend() + ggtitle(label = paste("Integrated LDLR−/− mouse model ","(n = ", dim(mus_int_sctype_LD@meta.data)[1], ")", sep = "")) + theme(title = element_text(size = 12))
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/mus_single_umap.png", width = 5.8, height = 4.3 )
+
+## Condition
+# Re factor covariates
+mus_int_sctype_LD$disease_status = factor(mus_int_sctype_LD$disease_status,
+                                                  levels = c("Control", "Late_disease"))
+ 
+
+DimPlot(mus_int_sctype_LD, label = F, repel = F, split.by = "disease_status") + NoLegend() +
+  NoAxes() + theme(strip.text = element_text(size = 13, face = "bold"), plot.subtitle = element_blank(), plot.title = element_text(size=12, face = "bold", hjust = 0.05, margin=margin(0,0,-40,0))) 
+   
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/mus_condition_umap.png", width = 5.8, height = 4.3 )
+
+### Mq & Condition
+Idents(mus_int_sctype_LD) = "sctype_immune"
+DefaultAssay(mus_int_sctype_LD) = "SCT"
+MQ_clusters = c("ISG expressing immune cells", "Non-classical monocytes")
+mq_subset = subset(mus_int_sctype_LD, idents = MQ_clusters)
+
+#https://r-charts.com/ggplot2/facets/
+DimPlot(mq_subset, label = F, repel = F, split.by = "disease_status") +
+    custom_theme +
+  NoAxes() + theme(strip.text = element_text(size = 12, face = "bold"), plot.subtitle = element_blank(), plot.title = element_text(size=12, face = "bold", hjust = 0.05, margin=margin(0,0,-40,0)), legend.text = element_text(size = 11)) +
+  labs(title = "Macrophage subpopulation changes in different conditions ") 
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/mus_MQ_condition_umap.png", width = 5.8, height = 4.3 )
+
+######
+
+metadata = mus_int_sctype_LD@meta.data
+dim(metadata)
+
+# Plot sample_disease_status
+table(metadata$disease_status)
+
+annot_disease = metadata %>%
+  ggplot(aes(x=disease_status, fill=manual_annotations)) + 
+  geom_bar(position = "fill", width = 0.4) + 
+  custom_theme + 
+  xlab("Condition") +
+  ylab("Cell proportion") + 
+  #npg_scale2_bars +
+  aaas_scale_bars +
+  theme(aspect.ratio = 1.7, axis.text = element_text(size = 10), legend.text = element_text(size = 10),
+        legend.title = element_text(size = 11)) + 
+  labs(fill = "Cell Annotation", x = "")
+
+ggsave(filename = "ord_et_al_GSE205930/Figures/CellNum_correction/mus_BarPlot_annot_disease.png", width = 7, height = 4.5, plot = annot_disease )
+
+
+```
+
+

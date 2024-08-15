@@ -1,0 +1,132 @@
+---
+title: "sc_Mus_Homo"
+output: html_document
+date: "2024-05-07"
+editor_options: 
+  chunk_output_type: console
+---
+
+# UpSet plot
+```{r}
+# Source: https://github.com/hms-dbmi/UpSetR
+# https://cran.r-project.org/web/packages/UpSetR/vignettes/basic.usage.html#example-2-choosing-the-top-largest-sets-and-plot-formatting  
+library(UpSetR)
+library(ComplexHeatmap)
+
+```
+
+
+## Data-frames
+```{r}
+# Mus (single-cell). This object is created using DE_MQ_scMouse_Atherosclerosis.Rmd script. 
+mus_mq_ld_gen = res_CT_LD$gene
+
+
+# Mus (Our Apoe model)
+apoe_model = readxl::read_xlsx("Hans_project/APOE_FC025updown_padj_005.xlsx")
+apoe_model = apoe_model %>% dplyr::rename("SYMBOL" = "...3") %>% filter(abs(logFC) > 1) %>% dplyr::select(-c(B, t))
+apoe_model$SYMBOL = trimws(apoe_model$SYMBOL)
+
+mus_apoe = apoe_model$SYMBOL
+
+# Homo. This object is created using DE_Analysis_Pan_Wirka_Hu.Rmd script.
+hu_mq_gen = gorth(res_mq_filtd$gene, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+hu_mq_gen = hu_mq_gen[!duplicated(hu_mq_gen)]
+
+```
+
+## Plot&Extract
+```{r}
+listInput = list(Mus_LDLR_knockout = mus_mq_ld_gen,
+                 Mus_apoE_knockout = mus_apoe,
+                Homo_atherosclerosis = hu_mq_gen, 
+                Integrative_genes = up_list_integ$SYMBOL) 
+
+#saveRDS(listInput, file = "pan_wirka_hu2/Figures/listInput_upsetPlot.rds")
+listInput = readRDS(file = "pan_wirka_hu2/Figures/listInput_upsetPlot.rds")
+
+pdf(file = "pan_wirka_hu2/Figures/upset_integ.pdf", width = 10, height = 7)
+
+upset(fromList(listInput), order.by = "freq", text.scale = c(1.3, 1.3, 1, 1, 1.5, 1.2),
+      point.size = 3.2, nsets = 8, number.angles  = 0, query.legend = "top",
+      queries = list(list(query = intersects, 
+    params = list("Integrative_genes", "Homo_atherosclerosis", "Mus_LDLR_knockout"), active = T, color="red", query.name = "Integrative genes in human and LDLR knockout mouse model (Macrophage)"), list(query = intersects, 
+    params = list("Integrative_genes", "Homo_atherosclerosis", "Mus_LDLR_knockout", "Mus_apoE_knockout"), active = T, color="blue", query.name = "Integrative genes in human, LDLR and apoE knockout mouse models"))) # without scale
+
+#upset(fromList(listInput), order.by = "freq", text.scale = c(1.3, 1.3, 1, 1, 1.5, 1),
+      #point.size = 3.2, nsets = 8, scale.sets = "log2", scale.intersections = "log2") # with scale
+
+dev.off()
+
+
+# Sanity check
+Reduce(intersect, listInput)
+
+## Extract
+# https://jokergoo.github.io/ComplexHeatmap-reference/book/upset-plot.html#upset-utility-functions
+
+# Make a Combination Matrix
+combs = make_comb_mat(listInput, mode = "distinct") #mode is "distinct"
+
+# See combinations
+combs 
+combs[comb_degree(combs)>3]
+
+set_size(combs)
+comb_degree(combs)
+comb_name(combs)
+comb_size(combs)
+
+combs[comb_size(combs) == 16] # what is the code for intersection of ALL MACs
+cat(paste(extract_comb(combs,"1011"), collapse = "\n"))
+cat(paste(extract_comb(combs,"1011"), collapse = ", "))
+secszehn = extract_comb(combs,"1011")
+
+
+combs[comb_size(combs) == 9]
+cat(paste(extract_comb(combs,"1111"), collapse = "\n"))
+cat(paste(extract_comb(combs,"1111"), collapse = ", "))
+neun = extract_comb(combs,"1111")
+
+
+```
+
+## Starnet
+```{r}
+# This is for using:  http://starnet.mssm.edu/
+secszehn_neun = c(secszehn, neun)
+saveRDS(secszehn_neun, file = "pan_wirka_hu2/Figures/secszehn_neun.rds")
+
+# convert to homo
+my_genes_hu = gorth(secszehn_neun, source_organism = "mmusculus", target_organism ="hsapiens" )$ortholog_name
+my_genes_hu = na.omit(my_genes_hu)
+my_genes_hu = my_genes_hu[!duplicated(my_genes_hu)]
+
+length(my_genes_hu) #26
+
+# Print the data frame without quotes
+cat(paste(my_genes_hu, collapse = "\n"))
+
+######
+
+# Define the data
+values <- c(2.0866841981337575e-9, 0.000367055864043674, 0.613964506127071, 1.2909536759213625, 2.0005198273044025, 3.23184486991641, 5.026812679620842, 9.247480301176145, 13.141519581986502, 15.311212701947458, 31.944442102445915, 37.208913437762476, 100)
+labels <- c("Diseased vessels", "fP-TG", "P-Chol", "SYNTAX", "Waist/Hip", "HbA1c", "CRP", "lesions", "fP-HDL-Chol", "BMI", "DUKE", "fP-LDL-Chol", "CAD DEG")
+
+data = data.frame(x = labels, y = values)
+
+# Generate the scatter plot
+ggplot(data, aes(x=reorder(x, y), y=y, color = y)) +
+  geom_point() +
+  scale_color_gradient(low = "blue", high = "red") +
+  geom_hline(yintercept = c(1.3), color="black", linetype="dashed") +
+    labs(x = "", y = "Enrichment -log10(P value)", title = "Atherosclerotic STAT1 targets module", subtitle = ) +
+  coord_flip() + theme_bw() + theme(axis.text.x = element_text( hjust = 1), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "white"), legend.position = "none", axis.text = element_text(size = 10), title = element_text(size = 12))
+
+ggsave(filename = "pan_wirka_hu2/Figures/integ_secszehn_neun_module.png", width = 5.8, height = 3.7 )
+
+```
+
+
+
+

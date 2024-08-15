@@ -1,0 +1,187 @@
+---
+title: "TF_InferActivity_Pan_Wirka_Hu"
+output: html_document
+date: "2024-04-22"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Function
+```{r}
+# source: https://github.com/raivokolde/pheatmap/issues/48
+# use this function to make row or column names bold
+# parameters:
+#   mat: the matrix passed to pheatmap
+#   rc_fun: either rownames or colnames
+#   rc_names: vector of names that should appear in boldface
+make_bold_names <- function(mat, rc_fun, rc_names) {
+  bold_names <- rc_fun(mat)
+  ids <- rc_names %>% match(rc_fun(mat))
+  ids %>%
+    walk(
+      function(i)
+        bold_names[i] <<-
+        bquote(bold(.(rc_fun(mat)[i]))) %>%
+        as.expression()
+    )
+  bold_names
+}
+
+setwd("Human/")
+```
+
+# MQ
+
+## lesion vs non-lesion
+This is manin chunk for figure generation.
+```{r}
+rpca_int_sct_v3 = read_rds("pan_wirka_hu2/Integration_Objs/rpca_int_sct_clustered_TS_Ucel_Sctype_anotd_Final.rds")
+
+rpca_int_sct_v3$sample_disease_status = factor(rpca_int_sct_v3$sample_disease_status,
+                                                  levels = c("non_lesion", "lesion"))
+
+DefaultAssay(rpca_int_sct_v3) = "integrated"
+
+rpca_int_sct_v3$cellType_cnd = paste0(rpca_int_sct_v3$annotations, "_", rpca_int_sct_v3$sample_disease_status)
+
+#MQ_clusters = c("Foamy_Mac","Inflammatory_Mac", "Tissue_resident_Mac", "Monocytes", "cDC")
+
+grep("Foam|Mono|Tissue|cDC|Infl", unique(rpca_int_sct_v3$cellType_cnd), value = T)
+mq_subset = subset(rpca_int_sct_v3, subset = cellType_cnd %in% grep("Foam|Mono|Tissue|cDC|Infl", unique(rpca_int_sct_v3$cellType_cnd), value = T))
+
+
+Idents(mq_subset) = "cellType_cnd"
+
+DimPlot(mq_subset, label = T, repel = T, split.by = "sample_disease_status") + NoLegend() + NoAxes()
+
+TFs <- c("STAT1", "STAT2", "STAT3", "STAT4", "STAT5", "STAT6",
+         "IRF1", "IRF2", "IRF3", "IRF4", "IRF5", "IRF6", "IRF7", "IRF8", "IRF9")
+
+
+# List available datasets
+data(package = "dorothea")
+
+# Read Dorothea regulons from mouse
+dorothea_regs_hs = get(data("dorothea_hs", package = "dorothea"))
+dorothea_regs_hs = as.data.frame(dorothea_regs_hs)
+dim(dorothea_regs_hs)
+head(dorothea_regs_hs)
+dorothea_regs_hs[dorothea_regs_hs$tf == "STAT1", ]  # "Stat1" & "Spi1"
+dorothea_regs_hs[dorothea_regs_hs$tf == "SPI1", ]
+dorothea_regs_hs[dorothea_regs_hs$target == "STAT1", ]
+
+# Let's get regulons based on interactions with high confidence levels  
+high_conf_regulons = dorothea_regs_hs %>%
+  dplyr::filter(confidence %in% c("A", "B", "C") | tf %in% TFs)
+
+dim(high_conf_regulons)
+
+# Compute Viper scores using SCT normalized data (include A-C scores to see what results look like; Takes time!)
+DefaultAssay(mq_subset) = "SCT"
+
+# CHECK!
+# mq_subset = subset(mq_subset, features = up_list_integ_human) # select integrative genes
+
+mq_subset_reg = dorothea::run_viper(mq_subset, 
+                                         regulons=high_conf_regulons,
+                                         assay_key = "SCT",
+                                         options = list(method="scale", 
+                                                        minsize=4,
+                                                        eset.filter=FALSE, 
+                                                        cores=16))
+
+
+# Scale tf activity scores
+DefaultAssay(mq_subset_reg) = "dorothea"
+mq_subset_reg = ScaleData(mq_subset_reg)
+
+# Refactor
+mq_subset_reg$cellType_cnd = factor(mq_subset_reg$cellType_cnd,
+                                    levels = c("Foamy_Mac_non_lesion", "Foamy_Mac_lesion",
+                                    "Tissue_resident_Mac_non_lesion", "Tissue_resident_Mac_lesion",
+                                    "Monocytes_non_lesion", "Monocytes_lesion",
+                                    "Inflammatory_Mac_non_lesion", "Inflammatory_Mac_lesion",
+                                    "cDC_non_lesion","cDC_lesion"))
+
+# Transform scaled viper scores into a df to better handle results
+viper_scores = GetAssayData(mq_subset_reg, slot = "scale.data", assay = "dorothea") %>%
+  data.frame() %>%
+  t()
+
+dim(viper_scores)
+
+viper_scores_df = viper_scores %>% data.frame() %>% mutate(cell = gsub("\\.", "-", rownames(.)))
+
+# Checking
+viper_scores_df %>% dplyr::slice(3080:3088) %>% dplyr::select(6:9, cell)
+
+# Create a df containing cells and clusters
+cells_clusters = data.frame(cell = names(Idents(mq_subset_reg)),
+                            cell_type = mq_subset_reg$cellType_cnd) ####CHECK!!!!!!!!!!
+
+
+
+# Create a df containing viper scores per cell and their respective cell type annotations
+viper_scores_clusters = viper_scores_df %>%
+  gather(tf, activity, -cell) %>%
+  inner_join(cells_clusters)
+
+head(viper_scores_clusters)
+#table(viper_scores_clusters$tf)
+
+# Summarize viper scores per cell type
+summarized_viper_scores = viper_scores_clusters %>%
+  group_by(tf, cell_type) %>%
+  summarise(avg = mean(activity),
+            std = sd(activity))
+head(summarized_viper_scores)
+
+# For visualization purposes, select the most variable TFs across clusters according to viper scores
+highly_var_tfs = summarized_viper_scores %>%
+  group_by(tf) %>%
+  mutate(var = var(avg)) %>%
+  ungroup() %>%
+  dplyr::filter(tf %in% TFs) %>% 
+  #arrange(desc(var)) %>% dplyr::filter(var > 0.2) %>%
+  #top_n(250, var) %>%
+  distinct(tf)
+dim(highly_var_tfs)
+
+# Prepare data for plot
+summarized_viper_scores_df = summarized_viper_scores %>%
+  semi_join(highly_var_tfs, by="tf") %>%
+  dplyr::select(-std) %>%
+  spread(tf, avg) %>%
+  data.frame(row.names = 1, check.names = FALSE)
+palette_length = 100
+
+
+my_breaks = c(seq(min(summarized_viper_scores_df), 0,
+                  length.out = ceiling(palette_length/2) + 1),
+              seq(max(summarized_viper_scores_df)/palette_length,
+                  max(summarized_viper_scores_df),
+                  length.out = floor(palette_length/2)))
+
+#my_color1 = colorRampPalette(c("darkblue", "white", "yellow", "red"))(palette_length)
+my_color2 = colorRampPalette(c("darkblue", "skyblue", "white", "yellow", "red"))(palette_length)
+#my_color3 = colorRampPalette(c("#053061", "#2171B5", "white", "#FFD92F", "#A50F15"))(palette_length) #A50F15. The other orange alternative is #FEB24C
+
+rownames(summarized_viper_scores_df)
+
+# Change the column orders
+#mat = t(summarized_viper_scores_df) %>% as.data.frame() %>% relocate("Macrophage_Pre_lesion", .after = "Macrophage_Control") %>% as.matrix()
+
+mat = t(summarized_viper_scores_df)
+
+viper_hmap = pheatmap::pheatmap(mat = mat, fontsize = 12,
+                                fontsize_row = 10, fontsize_col = 9, cluster_rows = T,
+                                color = my_color2 , breaks = my_breaks,
+                                main = "Transcription factor activity in macrophage subtypes \n based on all genes",
+                                angle_col = 45,
+                                treeheight_col = 0, border_color = NA, cluster_cols = F,
+                                labels_row = make_bold_names(mat, rownames, c("STAT1", "SPI1")))
+
+
+ggsave(filename = "pan_wirka_hu2/Figures/MQ_lesionVSnon_in_TFs_viper_Reorderd.png", plot = viper_hmap, width = 7.5, height = 9.2)
+```
+
