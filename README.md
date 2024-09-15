@@ -2,7 +2,7 @@
 
 This repository contains the scripts and motifs used in the article [Integrative Multi-Omics Analysis of IFNγ-induced Macrophages and Atherosclerotic Plaques Reveals Macrophage-dependent STAT1-Driven Transcription in Atherosclerosis](https://www.biorxiv.org/content/10.1101/2024.09.06.611606v1)
 
-![](./Fig1.png)
+![The schematic overview of the study](./Fig1.png)
 
 ---
 ### Repository Files
