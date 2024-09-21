@@ -8,6 +8,7 @@ This repository contains the scripts and motifs used in the article [Integrative
 ### Repository Files
 
 `Scripts:` This folder holds the scripts for analyzing and generating the figures used in the article.
+ * `DE_analysis_MQ.R` The script for bulk RNA-seq data analysis 
  * `MQ_Meta_Analysis_Bulk_Figures_2_3.Rmd` The script for bulk data analysis used in figures 2&3
  * `1_*` The scripts for single-cell data analysis in a mouse model
  * `2_*` The scripts for single-cell data analysis in human samples
