@@ -1,6 +1,6 @@
 # Integrative Multi-Omics Analysis of IFNγ-induced Macrophages and Atherosclerotic Plaques
 
-This repository contains the scripts and motifs used in the article [Integrative Multi-Omics Analysis of IFNγ-induced Macrophages and Atherosclerotic Plaques Reveals Macrophage-dependent STAT1-Driven Transcription in Atherosclerosis](https://www.biorxiv.org/content/10.1101/2024.09.06.611606v1)
+This repository contains the scripts and motifs used in the article [Integrative multi-omics analysis of IFNγ-induced macrophages and atherosclerotic plaques reveals macrophage-dependent STAT1-driven transcription in atherosclerosis](https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2025.1590953/full)
 
 ![The schematic overview of the study](./Fig1.png)
 
@@ -17,4 +17,4 @@ This repository contains the scripts and motifs used in the article [Integrative
 
 ---
 ### Citation
-> Eskandarian Boroujeni, M., Lopacinska, N., Antonczyk, A., Kluzek, K., Wesoly, J., & AR Bluyssen, H. (2024). Integrative Multi-Omics Analysis of IFNγ-induced Macrophages and Atherosclerotic Plaques Reveals Macrophage-dependent STAT1-Driven Transcription in Atherosclerosis. bioRxiv, 2024-09.
+> Eskandarian Boroujeni, M., Lopacinska, N., Antonczyk, A., Kluzek, K., Wesoly, J. and Bluyssen, H.A., 2025. Integrative multi-omics analysis of IFNγ-induced macrophages and atherosclerotic plaques reveals macrophage-dependent STAT1-driven transcription in atherosclerosis. Frontiers in Immunology, 16, p.1590953.
